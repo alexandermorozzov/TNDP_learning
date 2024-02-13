@@ -1,0 +1,12 @@
+n_bees: 15
+n_type1_bees: 5
+n_type2_bees: 5
+n_iterations: 400
+batch_size: 15
+neural_bees: true
+force_linking_unlinked: false
+
+defaults:
+  - _self_
+  - experiment: standard
+  - model: bestsofar_feb2023

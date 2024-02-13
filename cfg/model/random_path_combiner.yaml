@@ -1,0 +1,20 @@
+common:
+  dropout: 0.0
+  nonlin_type: ReLU
+  embed_dim: 2
+
+route_generator:
+  type: RandomPathCombiningRouteGenerator
+  kwargs:
+    force_linking_unlinked: false
+    logit_clip: null
+
+backbone_gn:
+  net_type: none
+  kwargs:
+    return_edges: false
+    in_node_dim: 4
+    in_edge_dim: 13
+
+defaults:
+  - _self_

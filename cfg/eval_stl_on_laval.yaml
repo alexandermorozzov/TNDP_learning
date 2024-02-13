@@ -1,0 +1,14 @@
+batch_size: 1
+experiment:
+  logdir: null
+  symmetric_routes: false
+
+eval:
+  n_routes: 79
+
+defaults:
+  - experiment: standard
+  - eval: lavalDA
+  - model: bestsofar_feb2023
+  - _self_
+  - override experiment/cost_function: pp

@@ -1,0 +1,14 @@
+batch_size: 1
+alg_kwargs:
+  alpha: 0.5
+  dsp_step: 0.05
+  min_access_egress: 5.92
+  max_dsp_threshold: 50
+  dsp_feeder_threshold: 42
+  dsp_local_threshold: 10
+  min_route_length_m: 0
+  termination_limit: 100
+
+defaults:
+  - _self_
+  - experiment: standard

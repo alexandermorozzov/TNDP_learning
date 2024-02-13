@@ -1,0 +1,11 @@
+n_iterations: 100
+iter_time_limit_s: 30
+demand_stddev: 50
+demand_duration_steps: 12
+dynamic_step_size: true
+
+defaults:
+  - _self_
+  - experiment: standard
+  - model: bestsofar_feb2023
+  - online_planner: bco
