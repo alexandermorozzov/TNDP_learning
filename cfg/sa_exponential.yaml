@@ -1,0 +1,13 @@
+alg_args:
+  n_iterations: 40000
+  schedule: 'exponential'
+  cooling_rate: 0.9999
+  initial_temp: 1
+  final_temp: 0.01
+  # reheating_threshold: 1000
+  # reheating_factor: 3
+  shorten_prob: 0.2
+
+defaults:
+  - _self_
+  - experiment: standard

@@ -102,12 +102,12 @@ def check_static_test_case(test_case, low_memory_mode):
                                 **test_case.nikolic_kwargs)
     pseudo_data = CityGraphData()
     pseudo_data.drive_times = test_case.times
-    pseudo_data.street_adj = test_case.street_edge_mat
     pseudo_data.demand = test_case.demand_mat
     pseudo_data[STOP_KEY].x = torch.zeros((test_case.times.shape[1], 2))
 
-    state = RouteGenBatchState(pseudo_data, nik_mod, len(test_case.routes))                           
-    state.add_new_routes(test_case.routes)
+    state = RouteGenBatchState(pseudo_data, nik_mod, len(test_case.routes[0]),
+                               2, 100)                           
+    state.add_new_routes([test_case.routes])
 
     results = nik_mod(state)
     assert torch.isclose(results.cost, test_case.gt_nikolic_cost).all()
@@ -140,8 +140,8 @@ def get_onedemand_testcase(mean_stop_time_s=60):
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
     street_edge_mat = torch.tensor([[0, 1000], 
                                     [1000, 0]], dtype=torch.float32)
     # use unique powers of two for each element, so we can tell which demands
@@ -180,8 +180,8 @@ def get_onedemand_symmetric_testcase(mean_stop_time_s=60):
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
     street_edge_mat = torch.tensor([[0, 1000], 
                                     [1000, 0]], dtype=torch.float32)
     # use unique powers of two for each element, so we can tell which demands
@@ -225,8 +225,8 @@ def get_linear_3nodes_testcase(mean_stop_time_s=60, transfer_time_s=300,
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
 
     # a -> b -> c
     street_edge_mat = torch.tensor([[0, 1000, float('inf')], 
@@ -291,8 +291,8 @@ def get_3nodes_vshape_testcase(mean_stop_time_s=60, transfer_time_s=300,
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
 
     street_edge_mat = torch.tensor([[0, float('inf'), 1000], 
                                     [float('inf'), 0, 1000], 
@@ -355,8 +355,8 @@ def get_3nodes_loop_unsatdemand_testcase(mean_stop_time_s=60,
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
 
     street_edge_mat = torch.tensor([[0, float('inf'), 1000], 
                                     [float('inf'), 0, 1000], 
@@ -386,25 +386,14 @@ def get_3nodes_loop_unsatdemand_testcase(mean_stop_time_s=60,
 
     # include unsatisfied demand
     w_2 = travel_time / sat_demand_mat.sum() + unsat_penalty
-    unsat_demand = demand_mat[1, 0] + demand_mat[1, 2]
-    gt_nikolic_cost = travel_time + w_2 * unsat_demand
+    gt_nikolic_cost = travel_time + w_2 * (demand_mat[1, 0] + demand_mat[1, 2])
 
-    unsat_penalty = unsat_demand * 2 * times.max() / demand_mat.sum()
-    gt_mine_cost = demand_time_weight * \
-        (travel_time / demand_mat.sum() + unsat_penalty)
+    gt_mine_cost = demand_time_weight * travel_time / sat_demand_mat.sum()
     gt_mine_cost += route_time_weight * (1000 + mean_stop_time_s)
     gt_mine_cost /= times.max()
     n_unserved = demand_mat[1, 0] + demand_mat[1, 2]
-    # 2 node pairs out of six are unbridged
-    max_edge_time = (street_edge_mat.isfinite() * times).flatten(1,2).max(-1)[0]
-    # route_penalty_cmpt = 2 * 3 * max_edge_time / times.flatten(1,2).max(-1)[0]
-    # dmd_penalty_cmpt = 2
-    # penalty_weight = route_time_weight * route_penalty_cmpt + \
-    #     demand_time_weight * dmd_penalty_cmpt
-    # cv_penalty = constraint_violation_weight * penalty_weight * (0.1 + 2 / 6)
-    # gt_mine_cost += cv_penalty.squeeze()
-
-    gt_mine_cost += constraint_violation_weight * (0.1 + 2 / 6)
+    # 2 node pairs out of nine are unbridged
+    gt_mine_cost += unserved_weight * (0.1 + 2 / 6)
 
     per_route_riders = torch.tensor([2+1, 16+4, 32+1],
                                     dtype=torch.float32)
@@ -434,8 +423,8 @@ def get_3nodes_loop_symmetric_testcase(mean_stop_time_s=60,
     mine_kwargs['route_time_weight'] = route_time_weight
     demand_time_weight = 1 - route_time_weight
     mine_kwargs['demand_time_weight'] = demand_time_weight
-    constraint_violation_weight = 2
-    mine_kwargs['constraint_violation_weight'] = constraint_violation_weight
+    unserved_weight = 2
+    mine_kwargs['unserved_weight'] = unserved_weight
 
     street_edge_mat = torch.tensor([[0, float('inf'), 1000], 
                                     [float('inf'), 0, 1000], 
@@ -485,14 +474,12 @@ def test_static_batched(low_memory_mode):
     max_n_nodes = max([tc.demand_mat.shape[0] for tc in test_cases])
     demand_tensor = torch.zeros((len(test_cases), max_n_nodes, max_n_nodes))
     times_tensor = demand_tensor.clone()
-    street_adjs = times_tensor.clone()
     gt_nik_costs = torch.zeros(len(test_cases), dtype=tc1.gt_nikolic_cost.dtype)
     gt_mine_costs = gt_nik_costs.clone()
     for bi, tc in enumerate(test_cases):
         n_nodes = tc.demand_mat.shape[0]
         demand_tensor[bi, :n_nodes, :n_nodes] = tc.demand_mat
         times_tensor[bi, :n_nodes, :n_nodes] = tc.times
-        street_adjs[bi, :n_nodes, :n_nodes] = tc.street_edge_mat
         gt_nik_costs[bi] = tc.gt_nikolic_cost
         gt_mine_costs[bi] = tc.gt_mine_cost
 
@@ -506,14 +493,13 @@ def test_static_batched(low_memory_mode):
         pd = CityGraphData()
         pd.drive_times = times_tensor[ii]
         pd.demand = demand_tensor[ii]
-        pd.street_adj = street_adjs[ii]
         pd[STOP_KEY].x = torch.zeros(n_nodes, 2)
         pseudo_data.append(pd)
 
     pseudo_data = Batch.from_data_list(pseudo_data)
-    n_routes = [len(tc.routes) for tc in test_cases]
+    max_n_routes = max([len(tc.routes) for tc in test_cases])
     routes = [tc.routes for tc in test_cases]
-    state = RouteGenBatchState(pseudo_data, nik_mod, n_routes)
+    state = RouteGenBatchState(pseudo_data, nik_mod, max_n_routes, 2, 100)
     state.add_new_routes(routes)
 
     results = nik_mod(state)
@@ -527,193 +513,6 @@ def test_static_batched(low_memory_mode):
     total_trips = results.trips_at_transfers.sum(dim=1)
     assert (total_trips == results.total_demand).all()
     assert torch.isclose(results.cost, gt_mine_costs).all()
-
-
-def test_shortest_path_action():
-    """ A grid city:
-    0 - 1 - 2 - 3 - 4
-    |   |   |   |   |
-    5 - 6 - 7 - 8 - 9
-    |   |   |   |   |
-    10- 11-12 -13 -14
-    |   |   |   |   |
-    15-16 -17 -18 -19
-    """
-    graph = CityGraphData()
-
-    # define the street adjacency matrix
-    street_adj = torch.full((20, 20), float('inf'))
-    for ii in range(20):
-        street_adj[ii, ii] = 0
-        if ii % 5 != 4:
-            street_adj[ii, ii+1] = 1
-            street_adj[ii+1, ii] = 1
-        if ii < 15:
-            street_adj[ii, ii+5] = 1
-            street_adj[ii+5, ii] = 1
-    graph.street_adj = street_adj
-
-    # define the demand matrix
-    demand = torch.zeros((20, 20))
-    demand[0, 1] = 1
-    demand[0, 5] = 1
-    demand[1, 2] = 1
-    demand[1, 6] = 1
-    demand[2, 3] = 1
-    demand[2, 7] = 1
-    demand[3, 4] = 1
-    demand[3, 8] = 1
-    demand[4, 9] = 1
-    demand[5, 6] = 1
-    demand[5, 10] = 1
-    demand[6, 7] = 1
-    demand[6, 11] = 1
-    demand[7, 8] = 1
-    demand[7, 12] = 1
-    demand[8, 9] = 1
-    demand[8, 13] = 1
-    demand[9, 14] = 1
-    demand[10, 11] = 1
-    demand[10, 15] = 1
-    demand[11, 12] = 1
-    demand[11, 16] = 1
-    demand[12, 13] = 1
-    demand[12, 17] = 1
-    demand[13, 14] = 1
-    demand[13, 18] = 1
-    demand[14, 19] = 1
-    demand[15, 16] = 1
-    demand[16, 17] = 1
-    demand[17, 18] = 1
-    demand[18, 19] = 1
-    graph.demand = demand
-
-    # define the drive times
-    # compute all shortest paths
-    nexts, times = floyd_warshall(street_adj)
-    graph.nexts = nexts.squeeze(0)
-    graph.drive_times = times.squeeze(0)
-
-    node_locs = torch.zeros((20, 2))
-    for ii in range(20):
-        node_locs[ii, 0] = ii % 5
-        node_locs[ii, 1] = ii // 5
-
-    node_degrees = torch.zeros((20, 2))
-    for ii in range(20):
-        node_degrees[ii, 0] = (street_adj[ii] < float('inf')).sum()
-        node_degrees[ii, 1] = (street_adj[:, ii] < float('inf')).sum()
-
-    graph[STOP_KEY].x = torch.cat((node_locs, node_degrees), dim=1)
-
-    state = RouteGenBatchState(graph, MyCostModule(), 2)
-
-    # start a route with a shortest-path action
-    action = torch.tensor([[5, 9]])
-    state.shortest_path_action(action)
-
-    # check that the route is correct
-    route = state.routes[0][0]
-    route = route[route >= 0]
-    assert (route == torch.tensor([5, 6, 7, 8, 9])).all()
-    assert state.total_route_time[0] == 4 * 2
-    assert state.n_routes_left_to_plan == 2
-    assert state.current_route_n_stops == 5
-
-    # extend the route and check again
-    action = torch.tensor([[9, 14]])
-    state.shortest_path_action(action)
-    route = state.routes[0][0]
-    route = route[route >= 0]
-    assert (route == torch.tensor([5, 6, 7, 8, 9, 14])).all()
-    assert state.total_route_time[0] == 5 * 2
-    assert state.n_routes_left_to_plan == 2
-    assert state.current_route_n_stops == 6
-
-    # extend the route and check again
-    action = torch.tensor([[14, 16]])
-    state.shortest_path_action(action)
-    route = state.routes[0][0]
-    route = route[route >= 0]
-    assert (route == torch.tensor([5, 6, 7, 8, 9, 14, 13, 12, 11, 16])).all()
-    assert state.total_route_time[0] == 9 * 2
-    assert state.n_routes_left_to_plan == 2
-    assert state.current_route_n_stops == 10
-
-    # extend the route at the start
-    action = torch.tensor([[2, 5]])
-    state.shortest_path_action(action)
-    route = state.routes[0][0]
-    route = route[route >= 0]
-    assert (route == \
-            torch.tensor([2, 1, 0, 5, 6, 7, 8, 9, 14, 13, 12, 11, 16])).all()
-    assert state.total_route_time[0] == 12* 2
-    assert state.n_routes_left_to_plan == 2
-    assert state.current_route_n_stops == 13
-
-    # end the route
-    action = torch.tensor([[-1, -1]])
-    state.shortest_path_action(action)
-    route = state.routes[0][0]
-    route = route[route >= 0]
-    assert (route == \
-            torch.tensor([2, 1, 0, 5, 6, 7, 8, 9, 14, 13, 12, 11, 16])).all()
-    assert state.total_route_time[0] == 12 * 2
-    assert state.n_routes_left_to_plan == 1
-    assert state.current_route_n_stops == 0
-    assert state.current_route_time == 0
-
-    # start a new route
-    action = torch.tensor([[0, 15]])
-    state.shortest_path_action(action)
-    route = state.routes[0][1]
-    route = route[route >= 0]
-    assert (route == torch.tensor([0, 5, 10, 15])).all()
-    assert state.current_route_time == 3 * 2
-    assert state.total_route_time[0] == 15 * 2
-    assert state.n_routes_left_to_plan == 1
-    assert state.current_route_n_stops == 4
-
-    # extend it
-    action = torch.tensor([[15, 18]])
-    state.shortest_path_action(action)
-    route = state.routes[0][1]
-    route = route[route >= 0]
-    assert (route == torch.tensor([0, 5, 10, 15, 16, 17, 18])).all()
-    assert state.current_route_time == 6 * 2
-    assert state.total_route_time[0] == 18 * 2
-    assert state.n_routes_left_to_plan == 1
-    assert state.current_route_n_stops == 7
-
-    # end it
-    action = torch.tensor([[-1, -1]])
-    state.shortest_path_action(action)
-    route = state.routes[0][1]
-    route = route[route >= 0]
-    assert (route == torch.tensor([0, 5, 10, 15, 16, 17, 18])).all()
-    assert state.total_route_time[0] == 18 * 2
-    assert state.n_routes_left_to_plan == 0
-    assert state.current_route_n_stops == 0
-    assert state.current_route_time == 0
-
-    # the two routes intersect, so all stops should be mutually reachable
-    covered_nodes = set([0, 5, 10, 15, 16, 17, 18, 
-                         2, 1, 0, 5, 6, 7, 8, 9, 14, 13, 12, 11, 16])
-    for node1 in range(20):
-        for node2 in range(20):
-            if node1 in covered_nodes and node2 in covered_nodes:
-                assert state.transit_times[0, node1, node2] < float('inf')
-            elif node1 == node2:
-                assert state.transit_times[0, node1, node2] == 0
-            else:
-                assert state.transit_times[0, node1, node2] == float('inf')
-
-    # # check route matrix is correct
-    # import pdb; pdb.set_trace()
-    
-    # # what if we already have a route?
-    # state.add_new_routes([[0, 1, 2, 3, 4, 9, 14, 19]])
-
 
 
 # from torch_geometric.loader import DataLoader

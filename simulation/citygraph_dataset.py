@@ -87,7 +87,7 @@ def get_default_train_and_eval_split(path, split=0.9, space_scale=0.01,
     return train_ds, eval_ds
 
 
-def get_dataset_from_config(ds_cfg):
+def get_dataset_from_config(ds_cfg, center_nodes=True):
     if ds_cfg['type'] == 'pickle':
         return CityGraphDataset(ds_cfg.path, transforms=None)
     elif ds_cfg['type'] == 'mumford':
@@ -95,7 +95,7 @@ def get_dataset_from_config(ds_cfg):
         extra_node_feats = ds_cfg.get('extra_node_feats', True)
         data = CityGraphData.from_mumford_data(ds_cfg.path, ds_cfg.city,
             scale_dynamically=do_scaling, extra_node_feats=extra_node_feats,
-            fully_connected_demand=True)
+            center_nodes=center_nodes)
         return [data]
     else:
         raise ValueError(f"Unknown dataset type {ds_cfg['type']}")
@@ -395,7 +395,7 @@ class CityGraphData(HeteroData):
     def from_mumford_data(instances_dir, instance_name='', 
                           assumed_speed_mps=SPEED_MPS,
                           scale_dynamically=True, extra_node_feats=True,
-                          fully_connected_demand=True):
+                          center_nodes=True):
         """
         instances_dir: the directory where the Mumford data is stored.
         instance_name: for the instances given in the Mumford dataset, this
@@ -409,7 +409,8 @@ class CityGraphData(HeteroData):
         node_locs = torch.tensor(np.genfromtxt(coords_path, skip_header=1),
                                  dtype=torch.float32)
         # center locs at 0, which is what the neural network expects
-        node_locs = node_locs - node_locs.mean(dim=0)
+        if center_nodes:
+            node_locs = node_locs - node_locs.mean(dim=0)
 
         # load street edges from travel times file
         tt_path = data_dir / (instance_name + 'TravelTimes.txt')
@@ -428,15 +429,12 @@ class CityGraphData(HeteroData):
                       euc_dists[has_valid_edge]
         meters_per_unit = edge_ratios.mean()
         assert meters_per_unit < float('inf')
-        env_size = node_locs.max(dim=0)[0] - node_locs.min(dim=0)[0]
-
         if scale_dynamically:
             log.info(f"Estimated meters per unit: {meters_per_unit}")
-            env_size *= meters_per_unit
+            side_len = max((node_locs.max(dim=0)[0] - node_locs.min(dim=0)[0]))
+            side_len *= meters_per_unit
+            log.info(f"Environment side length: {side_len} meters")
             node_locs *= meters_per_unit
-
-        log.info(f"Environment size: {env_size[0]} x {env_size[1]} meters")
-
 
         # convert this to our graph representation
         data = CityGraphData()
@@ -466,21 +464,15 @@ class CityGraphData(HeteroData):
 
         # compute demand features
         has_demand = od > 0
+        demand_feat = od[has_demand]
+        dd_feat = drive_times[has_demand]
+        dmd_edge_feat = torch.stack((demand_feat, dd_feat), dim=1)
+        dmd_idx = torch.stack(torch.where(has_demand))
 
-        if fully_connected_demand:
-            n_nodes = od.shape[0]
-            dmd_idx = torch.tensor(list(permutations(range(n_nodes), 2))).T
-        else:
-            dmd_idx = torch.stack(torch.where(has_demand))
-        
         data[DEMAND_KEY].edge_index = dmd_idx
-        demand_feat = od[dmd_idx[0], dmd_idx[1]]
-        drive_time_feat = drive_times[dmd_idx[0], dmd_idx[1]]
-        dmd_edge_feat = torch.stack((demand_feat, drive_time_feat), dim=1)
         data[DEMAND_KEY].edge_attr = dmd_edge_feat
         data.demand = od
         return data
-
 
     @property
     def drive_dists(self):
@@ -969,7 +961,7 @@ def main():
     parser.add_argument("--sparse_demand", action="store_true",
         help="make the demand graph not fully connected, so edges with 0 " \
              "demand don't exist.")
-    parser.add_argument("--sidelen", type=float, default=30_000, 
+    parser.add_argument("--sidelen", type=float, default=SIDE_LENGTH_M, 
                         help="in meters")
     parser.add_argument("-d", "--directed", action="store_true", 
         help="make the street and demand graphs directed (undirected by "\

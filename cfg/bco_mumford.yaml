@@ -7,3 +7,4 @@ force_linking_unlinked: false
 defaults:
   - _self_
   - experiment: standard
+  - init: nikolic

@@ -27,7 +27,7 @@ from simulation.citygraph_dataset import CityGraphData, \
     get_dataset_from_config, STOP_KEY
 from simulation.transit_time_estimator import RouteGenBatchState
 import learning.utils as lrnu
-from torch_utils import get_batch_tensor_from_routes
+from torch_utils import get_batch_tensor_from_routes, dump_routes
 
 
 def sample_from_model(model, state, cost_obj, n_samples=20, 
@@ -59,7 +59,8 @@ def sample_from_model(model, state, cost_obj, n_samples=20,
             min_route_len = state.min_route_len[ii:ii+sample_batch_size]
             max_route_len = state.max_route_len[ii:ii+sample_batch_size]
         batch_state = RouteGenBatchState(chunk, cost_obj, 
-                                         state.n_routes_to_plan)
+                                         n_routes, min_route_len, 
+                                         max_route_len)
         with torch.no_grad():
             plan_out = model(batch_state, greedy=False)
             batch_costs = cost_obj(plan_out.state).cost
@@ -67,12 +68,19 @@ def sample_from_model(model, state, cost_obj, n_samples=20,
         all_costs.append(batch_costs)
 
     all_costs = torch.cat(all_costs, dim=0).reshape(n_samples, -1)
+
+    # # plot a histogram of the costs, with 1/10th as many bins as samples
+    # import matplotlib.pyplot as plt
+    # plt.hist(all_costs.cpu().numpy().flatten(), bins= n_samples // 1)
+    # plt.savefig("cost_hist.png")
+    # print(f"Average cost of samples: {all_costs.mean()}")
+
     _, min_indices = all_costs.min(0)
     batch_size = len(flat_sample_inputs) // n_samples
     best_plans = [all_plans[mi * batch_size + ii] \
                   for ii, mi in enumerate(min_indices)]
-    best_plans_tensor = get_batch_tensor_from_routes(best_plans)
-    state.add_new_routes(best_plans_tensor)
+    best_plans = get_batch_tensor_from_routes(best_plans)
+    state.add_new_routes(best_plans)
     return state
 
 
@@ -90,7 +98,7 @@ def eval_model(model, eval_dataloader, eval_cfg, cost_obj, sum_writer=None,
                                sample_batch_size=sample_batch_size), 
              None)
     cost, _, metrics, routes = \
-        lrnu.test_method(method_fn, eval_dataloader, eval_cfg, cost_obj, 
+        lrnu.test_method(method_fn, eval_dataloader, eval_cfg, None, cost_obj, 
                          sum_writer, device=device, silent=silent, 
                          iter_num=iter_num, return_routes=True)
     if return_routes:
@@ -116,10 +124,11 @@ def main(cfg: DictConfig):
     # evaluate the model on the dataset
     n_samples = cfg.get('n_samples', None)
     sbs = cfg.get('sample_batch_size', cfg.batch_size)
-    _, _, routes = eval_model(model, test_dl, cfg.eval, cost_fn, 
+    _, _, routes = eval_model(model, test_dl, cfg.eval, None, cost_fn, 
         n_samples=n_samples, sample_batch_size=sbs, return_routes=True, 
         device=DEVICE)
-    lrnu.dump_routes(run_name, routes.cpu())
+    
+    dump_routes(run_name, routes.cpu())
 
 
 if __name__ == "__main__":

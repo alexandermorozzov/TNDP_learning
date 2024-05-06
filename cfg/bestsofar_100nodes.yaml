@@ -1,22 +1,23 @@
-batch_size: 64
+batch_size: 8
 n_epochs: 5
 reward_scale: 1.0
 lr: 0.0016134816080499328
 decay: 0.0008404361781997002
 optimizer: Adam
 baseline_mode: neural
+# eval_n_routes: [1, 5, 10, 15, 20]
 discount_rate: null
 entropy_weight: 0.0
 
 eval:
-  min_route_len: 2
-  max_route_len: 12
+  min_route_len: 10
+  max_route_len: 20
   n_routes: 10
 
 dataset:
   type: pickle
   kwargs:
-    path: datasets/20_nodes/mixed
+    path: datasets/100_nodes/mixed
     space_scale: 0.6
     demand_scale: 0.2
 

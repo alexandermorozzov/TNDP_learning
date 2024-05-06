@@ -35,12 +35,12 @@ def main():
                                       values=args.value)
         std = grp.std().pivot_table(index=pivot_index, columns=['Environment'], 
                                     values=args.value)
-        pcnt_std = std * 100 / mean
         mean = pd.DataFrame([row.apply(lambda xx: '{:.3f}'.format(xx))
                             for _, row in mean.iterrows()])
-        pcnt_std = pd.DataFrame([row.apply(lambda xx: '{:.0f}\%'.format(xx))
-                                for _, row in pcnt_std.iterrows()])
-        both = mean + ' $\pm$ ' + pcnt_std
+        std = pd.DataFrame([row.apply(lambda xx: '{:.3f}'.format(xx))
+                            for _, row in std.iterrows()])
+        both = mean + ' $\pm$ ' + std
+        
         print(f'alpha = {alpha}')
         # print the latex table
         print(both.to_latex(float_format='%.3f', escape=False))

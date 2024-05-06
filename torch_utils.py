@@ -33,7 +33,8 @@
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-
+from pathlib import Path
+import pickle
 
 # currently unused, but might be useful in the future
 def batch_2combinations(sequences):
@@ -85,7 +86,7 @@ def get_update_at_mask(tensor, mask, new_value=0):
 
     # add singleton dimensions to the mask as needed for the below arithmetic
     while mask.ndim < tensor.ndim:
-        mask = mask.unsqueeze(-1)
+        mask.unsqueeze_(-1)
     updated = tensor * ~mask + new_value * mask
 
     return updated
@@ -487,11 +488,6 @@ def aggr_edges_over_sequences(seqs_tensor, edge_features, agg_mode="sum",
 
 
 def get_route_leg_times(batch_routes, drive_times_matrix, mean_stop_time_s=0):
-    add_route_dim = batch_routes.ndim == 2
-    if add_route_dim:
-        # add a route dimension
-        batch_routes = batch_routes[:, None]
-
     batch_idxs = torch.arange(batch_routes.shape[0], 
                               device=batch_routes.device)
     # batch_size x n_routes x route_len - 1
@@ -505,9 +501,6 @@ def get_route_leg_times(batch_routes, drive_times_matrix, mean_stop_time_s=0):
     leg_times += mean_stop_time_s
     invalid_leg_mask = (batch_routes == -1)[..., 1:]
     leg_times = get_update_at_mask(leg_times, invalid_leg_mask)
-    if add_route_dim:
-        # remove the extra dimension we added from the output
-        leg_times.squeeze_(1)
     return leg_times
 
 
@@ -638,8 +631,7 @@ def get_batch_tensor_from_routes(routes, device=None):
     if device is None and isinstance(routes[0][0], torch.Tensor):
         device = routes[0][0].device
         
-    scen_tensors = [get_tensor_from_varlen_lists(sr, device)[0] 
-                    for sr in batch_routes]
+    scen_tensors = [get_tensor_from_varlen_lists(sr)[0] for sr in batch_routes]
     batch_size = len(scen_tensors)
     max_n_routes = max([st.shape[0] for st in scen_tensors])
     max_n_stops = max([st.shape[1] for st in scen_tensors])
@@ -653,12 +645,9 @@ def get_tensor_from_varlen_lists(lists, device=None, add_dummy=False):
     """Converts a list of lists or 1D tensors with possibly-variable lengths
         into a single 2D tensor and a mask indicating which entries of the
         tensor are padding values."""
+    max_list_len = max([len(rr) for rr in lists])
     tensor_len = len(lists)
-    if len(lists) > 0:
-        max_list_len = max([len(rr) for rr in lists])
-    else:
-        max_list_len = 0
-    if device is None and len(lists) > 0 and type(lists[0]) is torch.Tensor:
+    if device is None and type(lists[0]) is torch.Tensor:
         device = lists[0].device
     if add_dummy:
         tensor_len += 1
@@ -672,15 +661,53 @@ def get_tensor_from_varlen_lists(lists, device=None, add_dummy=False):
     return out_tensor, padding_mask
 
 
-def get_unselected_routes(bee_scenarios, selected_idxs):
+def get_unselected_routes(networks, selected_idxs):
+    # create a mask that is 0 at all nodes of selected routes, 1 elsewhere
+    # add route and node dimensions to the selected indices
     scatter_idxs = selected_idxs[..., None, None]
-    scatter_idxs = scatter_idxs.expand(-1, -1, -1, bee_scenarios.shape[-1])
-    mask = torch.ones_like(bee_scenarios).scatter(2, scatter_idxs, 0)
-    unselected_shape = list(bee_scenarios.shape)
-    unselected_shape[2] -= 1
-    unselected_idxs = mask.nonzero()[:, 2].reshape(*unselected_shape)
-    unselected_routes = bee_scenarios.gather(2, unselected_idxs)
+    # expand the node dimension to the size of the tensor
+    exp_target = [-1] * (scatter_idxs.ndim - 1) + [networks.shape[-1]]
+    scatter_idxs = scatter_idxs.expand(exp_target)
+    mask = torch.ones_like(networks).scatter(-2, scatter_idxs, 0)
+    # assemble a tensor of indices to gather the unselected routes
+    unselected_shape = list(networks.shape)
+    unselected_shape[-2] -= 1
+    unselected_idxs = mask.nonzero()[:, -2].reshape(*unselected_shape)
+    # get the unselected routes and return them
+    unselected_routes = networks.gather(-2, unselected_idxs)
     return unselected_routes
+
+
+def dump_routes(run_name, all_route_sets, out_dir='output_routes'):
+    """
+    run_name: a string to identify the run
+    all_route_sets: a list of tensors, the routes used for each city
+    """
+    if type(out_dir) is str:
+        out_dir = Path(out_dir)
+    if not out_dir.exists():
+        out_dir.mkdir()
+    out_path = out_dir / (run_name + '_routes.pkl')
+    if type(all_route_sets) is not torch.Tensor:
+        all_route_sets = get_batch_tensor_from_routes(all_route_sets)
+        
+    all_route_sets = all_route_sets.cpu()
+    # convert to a list of route sets for each city
+    if all_route_sets.ndim == 2:
+        all_route_sets = [all_route_sets]
+    elif all_route_sets.ndim == 3:
+        all_route_sets = [rs for rs in all_route_sets]
+
+    with out_path.open('wb') as ff:
+        pickle.dump(all_route_sets, ff)
+
+
+def load_routes_tensor(path, device=None):
+    if type(path) is str:
+        path = Path(path)
+    with path.open('rb') as ff:
+        route_sets = pickle.load(ff)
+    return torch.stack(route_sets, 0).to(device=device)
 
 
 def cat_var_size_tensors(tensors, dim=0):

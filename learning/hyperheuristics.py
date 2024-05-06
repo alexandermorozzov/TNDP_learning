@@ -28,8 +28,7 @@ import hydra
 
 from torch_utils import reconstruct_all_paths, floyd_warshall, \
     get_route_edge_matrix, get_batch_tensor_from_routes, \
-    get_route_leg_times, get_unselected_routes
-# from learning.bee_colony import build_init_scenario
+    get_route_leg_times, get_unselected_routes, dump_routes
 from simulation.citygraph_dataset import get_dataset_from_config
 import learning.utils as lrnu
 
@@ -73,15 +72,24 @@ class HeuristicSequence:
         self._seq_idxs[reset_mask] = 0
 
 
-def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None, 
-                   init_scenario=None, model=None, silent=False,
+def hyperheuristic(state, cost_obj, f_0, delta_F=None, duration_s=None, 
+                   n_steps=None, init_network=None, model=None, silent=False, 
                    sum_writer=None):
     """
-    graph_data -- A CityGraphData object containing the graph data.
-    n_routes -- The number of routes in each candidate scenario, called NBL in
-        the paper.
-    cost_fn -- A function that determines the cost (badness) of a scenario.  In
-        the paper, this is wieghted total travel time.
+    state: The initial state of the system, not including the routes.
+    cost_obj: The cost-function object.
+    f_0: The Great Deluge final cost level.
+    delta_F: The starting level's height over the final level (that is, the 
+        starting level is f_0 + delta_F)
+    duration_s: The maximum duration to run the algorithm for (exclusive with 
+        n_steps).
+    n_steps: The number of iterations to run the algorithm for (exclusive with
+        duration_s).
+    init_network: The initial network to start from.
+    model: The neural network model to use for the neural heuristic.  No neural
+        heuristic will be used if this is None.
+    silent: Whether to suppress the progress bar.
+    sum_writer: The tensorboard summary writer to log the results to.
     """
     assert duration_s is not None or n_steps is not None
     heuristics = [
@@ -97,61 +105,55 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
         # heuristic_bee3,
     ]
     if model is not None:
-        heuristics.append(lambda *args, **kwargs: neural_heuristic(*args, 
-                                                                   state=state,
-                                                                   model=model,
-                                                                   **kwargs))
+        heuristics.append(lambda *args, 
+                          **kwargs: neural_heuristic(*args, state=state,
+                                                     model=model, **kwargs))
     n_hrstcs = len(heuristics)
 
     # add the special no-op heuristic, which isn't part of n_hrstcs
     heuristics.append(noop_heuristic)
 
     dev = state.device
+    if dev.type != 'cpu':
+        gpu_state = state
+        state = state.to_device('cpu')
+
     batch_size = state.batch_size
 
-    # create the initial scenario
+    # create the initial network
     shortest_paths, _ = reconstruct_all_paths(state.nexts.cpu())
     max_n_nodes = state.max_n_nodes
     demand = torch.zeros((batch_size, max_n_nodes+1, max_n_nodes+1), 
                          device=dev)
     demand[:, :-1, :-1] = state.demand
-    no_given_init = init_scenario is None
     n_routes = state.n_routes_to_plan
     min_route_len = state.min_route_len
     max_route_len = state.max_route_len
-    if not no_given_init:
+
+    if init_network is not None:
         tmp = torch.full((batch_size, n_routes, max_n_nodes), -1)
-        tmp[:, :, :init_scenario.shape[-1]] = init_scenario
-        init_scenario = tmp
+        tmp[:, :, :init_network.shape[-1]] = init_network
+        init_network = tmp
 
-    init_scen_path = Path('hh_init_scenario.pkl')
-    if init_scen_path.exists():
-        log.info('Loading initial scenario from file')
-        with init_scen_path.open('rb') as ff:
-            scenario = pickle.load(ff)
-    else:
-        scenario = build_init_scenario(shortest_paths, state,
-                                       init_scenario=init_scenario)     
-        scenario = scenario.cpu()
-        with init_scen_path.open('wb') as ff:
-            pickle.dump(scenario, ff)
-
-    best_scenario = scenario.clone()
+    network = build_init_network(shortest_paths, state, init_network, 
+                                 sum_writer)
+    network = network.cpu()
+    best_network = network.clone()
     sp_lens = (shortest_paths > -1).sum(dim=-1).cpu()
 
-    def cost_fn_wrapper(scenario, step):
+    def cost_fn_wrapper(network, step):
         # we use CPU in the algorithm because it's faster, but the cost fn
          # is faster on GPU.
         if dev.type != 'cpu':
-            state.replace_routes(scenario.to(dev))
-            result = cost_obj(state, no_norm=True)
+            gpu_state.replace_routes(network.to(dev))
+            result = cost_obj(gpu_state)
             cost = result.cost.cpu()
         else:
-            state.replace_routes(scenario)
-            result = cost_obj(state, no_norm=True)
+            state.replace_routes(network)
+            result = cost_obj(state)
             cost = result.cost
         
-        nv = count_violations(scenario, max_n_nodes, n_routes, sp_lens, 
+        nv = count_violations(network, max_n_nodes, n_routes, sp_lens, 
                               state.demand[0], min_route_len, max_route_len, 
                               state.symmetric_routes)
         cost[nv > 0] = float('inf')
@@ -159,11 +161,11 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
         sum_writer.add_scalar('mean violations', nv.float().mean(), step)
         return cost, result.get_metrics_tensor()
 
-    best_cost, best_metrics = cost_fn_wrapper(scenario, 0)
-    print('starting metrics:', best_metrics)
+    best_cost, best_metrics = cost_fn_wrapper(network, 0)
+    log.info(f'starting metrics: {best_metrics}')
 
-    # multiply by 2 to allow more exploration at first
-    delta_F = max(best_cost - f_0, 0) # * 2
+    if delta_F is None:
+        delta_F = max(best_cost - f_0, 0)
     cost_history = [best_cost]
 
     metric_names = cost_obj.get_metric_names()
@@ -199,20 +201,20 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
         is_seq_done = is_sequence_done(seq_mat, next_idxs)
         if is_seq_done.any():
             # apply the sequence of heuristics
-            done_scens = scenario[is_seq_done]
+            done_scens = network[is_seq_done]
             done_heurseqs = heuristics_sequence.get_sequences(is_seq_done)
-            new_scenario = apply(done_scens, done_heurseqs, heuristics,
+            new_network = apply(done_scens, done_heurseqs, heuristics,
                                  state, shortest_paths[0])
-            step_scenario = scenario.clone()
-            step_scenario[is_seq_done] = new_scenario
+            step_network = network.clone()
+            step_network[is_seq_done] = new_network
             # we're just recomputing it for the ones that aren't done...
-            new_cost, new_metrics = cost_fn_wrapper(step_scenario, step)
+            new_cost, new_metrics = cost_fn_wrapper(step_network, step)
 
-            # update the best scenarios that have improved over the old best
+            # update the best networks that have improved over the old best
             is_improved = new_cost < best_cost
             best_cost[is_improved] = new_cost[is_improved]
             best_metrics[is_improved] = new_metrics[is_improved]
-            best_scenario[is_improved] = step_scenario[is_improved]
+            best_network[is_improved] = step_network[is_improved]
 
             # update the matrices
             imp_hrstc_seq = heuristics_sequence.get_sequences(is_improved)
@@ -222,7 +224,7 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
             trans_mat[is_improved] = imp_trans_mat
             seq_mat[is_improved] = imp_seq_mat
 
-            # update the candidate scenario by the great deluge strategy
+            # update the candidate network by the great deluge strategy
             if duration_s is not None:
                 accepted = accept(new_cost, time_elapsed_s, duration_s, f_0, 
                                   delta_F)
@@ -230,11 +232,11 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
                 accepted = accept(new_cost, step, n_steps, f_0, delta_F)
             
             if accepted.any():
-                print('accepted!')
+                log.debug('accepted!')
             
             accepted[is_improved] = True
             accepted = accepted[:, None, None]
-            scenario = step_scenario * accepted + scenario * ~accepted
+            network = step_network * accepted + network * ~accepted
 
             # reset to prepare for the next sequence
             heuristics_sequence.reset_seqs(is_seq_done)
@@ -247,7 +249,7 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
             for name, vals in zip(metric_names, best_metrics.unbind(-1)):
                 sum_writer.add_scalar(f'mean {name}', vals.mean(), step)
 
-            sum_writer.add_scalar('mean cost', best_cost.mean(), step)
+            sum_writer.add_scalar('best cost', best_cost.mean(), step)
 
         if duration_s is not None:
             new_time_elapsed_s = time.process_time() - start_time_s
@@ -259,26 +261,26 @@ def hyperheuristic(state, cost_obj, f_0, duration_s=None, n_steps=None,
             pbar.update(1)
 
     pbar.close()
-    state.replace_routes(best_scenario.to(dev))
+    state.replace_routes(best_network)
     return state, torch.stack(cost_history, dim=1).to(dev)
 
 
-def build_init_scenario(shortest_paths, state, init_scenario=None):
+def build_init_network(shortest_paths, state, init_network=None, 
+                       sum_writer=None):
     batch_size = shortest_paths.shape[0]
-    scenarios = []
+    networks = []
     for bi in range(batch_size):
-        if init_scenario is not None:
-            bis = init_scenario[bi]
+        if init_network is not None:
+            bis = init_network[bi]
         else:
             bis = None
-        scenario = \
-            _build_init_scenario_helper(shortest_paths[bi], state, 
-                                        init_scenario=bis)
-        scenarios.append(scenario)
-    return torch.stack(scenarios, dim=0)
+        network = _build_init_network_helper(shortest_paths[bi], state, bis,
+                                             sum_writer)
+        networks.append(network)
+    return torch.stack(networks, dim=0)
 
 
-def _build_init_scenario_helper(shortest_paths, state, init_scenario=None):
+def _build_init_network_helper(shortest_paths, state, init_network, sum_writer):
     n_nodes = shortest_paths.shape[0]
     n_nodes = state.max_n_nodes
     min_stops = state.min_route_len[0]
@@ -294,29 +296,29 @@ def _build_init_scenario_helper(shortest_paths, state, init_scenario=None):
     if max_stops is not None:
         is_valid_len &= path_lens <= max_stops
     
-    if init_scenario is not None:
-        # use the provided initial scenario
-        scenario = init_scenario.to(state.device)
-        nv = count_violations(scenario, n_nodes, n_routes, square_pathlens, 
+    if init_network is not None:
+        # use the provided initial network
+        network = init_network.to(state.device)
+        nv = count_violations(network, n_nodes, n_routes, square_pathlens, 
                               state.demand[0], min_stops, max_stops, 
                               symmetric_routes)[0]
     else:
-        # assemble an initial scenario
+        # assemble an initial network
         shortest_paths = shortest_paths[is_valid_len]
         path_lens = path_lens[is_valid_len]
         already_used = torch.zeros_like(path_lens, dtype=torch.bool)
-        scenario = torch.full((n_routes, shortest_paths.shape[-1]), -1, 
+        network = torch.full((n_routes, shortest_paths.shape[-1]), -1, 
                               device=shortest_paths.device)
                                 
-        nv = count_violations(scenario, n_nodes, n_routes, square_pathlens, 
+        nv = count_violations(network, n_nodes, n_routes, square_pathlens, 
                               state.demand[0], min_stops, max_stops,
                               symmetric_routes)[0]
-        log.info(f'Building initial scenario')
+        log.info(f'Building initial network')
         for route_idx in tqdm(range(n_routes)):
             # try possible routes
             new_nv_chunks = []
             for path_chunk in torch.split(shortest_paths, 100):
-                scen_chunk = scenario[None].repeat(len(path_chunk), 1, 1)
+                scen_chunk = network[None].repeat(len(path_chunk), 1, 1)
                 scen_chunk[:, route_idx, :path_chunk.shape[-1]] = path_chunk
                 exp_lens = square_pathlens.repeat(len(path_chunk), 1, 1)
                 new_nvs = count_violations(scen_chunk, n_nodes, n_routes, 
@@ -333,13 +335,13 @@ def _build_init_scenario_helper(shortest_paths, state, init_scenario=None):
             # pick the one with the fewest violations
             nv, best_path_idx = new_nvs.min(dim=0)
             choice = shortest_paths[best_path_idx]
-            scenario[route_idx] = -1
-            scenario[route_idx, :choice.shape[-1]] = choice
+            network[route_idx] = -1
+            network[route_idx, :choice.shape[-1]] = choice
             already_used[best_path_idx] = True
         
-        tmp = torch.full((n_routes, n_nodes), -1, device=scenario.device)
-        tmp[:, :scenario.shape[-1]] = scenario
-        scenario = tmp
+        tmp = torch.full((n_routes, n_nodes), -1, device=network.device)
+        tmp[:, :network.shape[-1]] = network
+        network = tmp
 
     # repair procedure
     heuristics = [
@@ -352,51 +354,53 @@ def _build_init_scenario_helper(shortest_paths, state, init_scenario=None):
         heuristic_6,
     ]
 
-    log.info('Repairing initial scenarios')
+    log.info('Repairing initial networks')
     ii = 0
+    # using "simple random" and "improve or equal", search for a valid network
     while nv > 0:
-        # simple random, improve or equal
-        # select a hyperheuristic randomly
+        # select a heuristic randomly
         heur_idx = torch.randint(len(heuristics), (1,))
         heuristic = heuristics[heur_idx]
         # apply it
-        modified_scen = heuristic(scenario.clone(), state)
+        modified_scen = heuristic(network.clone(), state)
         new_nv = count_violations(modified_scen[None], n_nodes, n_routes, 
                                   square_pathlens, state.demand[0], min_stops, 
                                   max_stops, symmetric_routes)
         if new_nv <= nv:
             # accept the change if it doesn't make things worse
-            scenario = modified_scen
+            network = modified_scen
             nv = new_nv
         ii += 1
         if ii % 1000 == 0:
             log.info(f'Iteration {ii}, violations: {nv.item()}')
-                    
-    return scenario.cpu()
+    
+    if sum_writer is not None:
+        sum_writer.add_scalar('# init repair iterations', float(ii), 0)
+    return network.cpu()
 
 
-def count_violations(scenario, n_nodes, required_n_routes, sp_lens,
+def count_violations(network, n_nodes, required_n_routes, sp_lens,
                      demand, min_stops=2, max_stops=None, 
                      symmetric_routes=True):
-    if scenario.ndim == 2:
+    if network.ndim == 2:
         batch_size = 1
-        scenario = scenario[None]
+        network = network[None]
     else:
-        batch_size = scenario.shape[0]
+        batch_size = network.shape[0]
     # count uncovered nodes
     is_covered = torch.zeros((batch_size, n_nodes + 1), dtype=torch.bool, 
-                             device=scenario.device)
-    batch_idxs = torch.arange(batch_size, device=scenario.device)
-    for scen_route in scenario.transpose(0, 1):
+                             device=network.device)
+    batch_idxs = torch.arange(batch_size, device=network.device)
+    for scen_route in network.transpose(0, 1):
         is_covered[batch_idxs[:, None], scen_route] = True
-    # is_covered[batch_idxs, scenario] = True
+    # is_covered[batch_idxs, network] = True
     n_uncovered = n_nodes - is_covered[:, :-1].sum(dim=-1)
     assert (n_uncovered >= 0).all()
 
     # count duplicate stops in routes
     n_duplicates = torch.zeros((batch_size,), dtype=torch.long, 
-                               device=scenario.device)
-    for bi, batch_elem in enumerate(scenario):
+                               device=network.device)
+    for bi, batch_elem in enumerate(network):
         for route in batch_elem:
             valid_route = route[route > -1]
             n_unique = valid_route.unique().shape[0]
@@ -408,8 +412,8 @@ def count_violations(scenario, n_nodes, required_n_routes, sp_lens,
 
     # count un-connected vertices.  If more than 2 transfers, doesn't count.
     dummy_dtm = torch.ones((batch_size, n_nodes + 1, n_nodes + 1),
-                           device=scenario.device)
-    route_matrix = get_route_edge_matrix(scenario, dummy_dtm, 0,
+                           device=network.device)
+    route_matrix = get_route_edge_matrix(network, dummy_dtm, 0,
                                          symmetric_routes=symmetric_routes)
 
     # direct_link = route_matrix.isfinite().float()
@@ -432,8 +436,8 @@ def count_violations(scenario, n_nodes, required_n_routes, sp_lens,
     assert (n_unconnected_pairs >= 0).all()
 
     # count out-of-bounds stops
-    route_lens = (scenario != -1).sum(dim=-1)
-    zero = torch.zeros(1, dtype=int, device=scenario.device)
+    route_lens = (network != -1).sum(dim=-1)
+    zero = torch.zeros(1, dtype=int, device=network.device)
     n_route_stops_under = (min_stops - route_lens).maximum(zero)
     if max_stops is None:
         max_stops = route_lens
@@ -456,7 +460,7 @@ def count_violations(scenario, n_nodes, required_n_routes, sp_lens,
      # correspondence with one of the authors, it is what they do.
     path_n_skips = sp_lens - 2
     path_n_skips.clamp_(min=0)
-    leg_n_skips = get_route_leg_times(scenario, path_n_skips)
+    leg_n_skips = get_route_leg_times(network, path_n_skips)
     total_n_skips = leg_n_skips.sum(dim=(1, 2))
     assert (total_n_skips >= 0).all()
     n_violations += total_n_skips
@@ -492,21 +496,21 @@ def is_sequence_done(seq_mat, next_idxs):
     return done_probs > torch.rand_like(done_probs)
 
 
-def apply(scenario, hrstc_idx_seq, heuristics, state, shortest_paths):
-    """Apply a sequence of heuristics to a scenario.
+def apply(network, hrstc_idx_seq, heuristics, state, shortest_paths):
+    """Apply a sequence of heuristics to a network.
 
     sequence -- A list of indices into the heuristics list.
-    scenario -- A tensor of routes.
+    network -- A tensor of routes.
     heuristics -- A list of heuristic functions.
     """
-    scenario = scenario.clone()
+    network = network.clone()
     for idxs in hrstc_idx_seq.T:
         for bi, hi in enumerate(idxs):
-            post_scen = heuristics[hi](scenario[bi], state=state, 
+            post_scen = heuristics[hi](network[bi], state=state, 
                                        shortest_paths=shortest_paths)
-            scenario[bi] = post_scen
+            network[bi] = post_scen
 
-    return scenario
+    return network
 
 
 def update_matrices(hrstc_idx_seq, trans_mat, seq_mat):
@@ -547,175 +551,175 @@ def accept(new_cost, progress, duration, f_0, delta_F):
     return new_cost <= level
 
 
-def neural_heuristic(scenario, state, model, *args, **kwargs):
+def neural_heuristic(network, state, model, *args, **kwargs):
     """Use a neural network to plan a new route."""
     # drop a random route
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
-    remaining_scenario = get_unselected_routes(scenario[None], route_idx)
-    state.replace_routes(remaining_scenario)
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
+    remaining_network = get_unselected_routes(network[None], route_idx)
+    state.replace_routes(remaining_network)
     result = model.step(state, greedy=False)
     return result.routes_tensor[0]
 
 
-def heuristic_0(scenario, state, **kwargs):
+def heuristic_0(network, state, **kwargs):
     """select a random route and add a random new node at a random position"""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
+    assert network.ndim == 2, "batched networks not supported yet!"
 
     # select a route that isn't already full
-    route_lens = (scenario != -1).sum(dim=-1)
+    route_lens = (network != -1).sum(dim=-1)
 
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
     route_len = route_lens[route_idx][0]
-    route = scenario[route_idx][0]
+    route = network[route_idx][0]
 
     n_nodes_available = state.max_n_nodes - route_len
     if n_nodes_available == 0:
-        # route is already full, so just return the original scenario
-        return scenario
+        # route is already full, so just return the original network
+        return network
     new_node_subidx = torch.randint(n_nodes_available, (1,),
-                                    device=scenario.device)
+                                    device=network.device)
     unused_nodes = list(set(range(state.max_n_nodes)) - set(route.tolist()))
     new_node = unused_nodes[new_node_subidx]
 
-    new_pos_floats = torch.rand((1,), device=scenario.device)
+    new_pos_floats = torch.rand((1,), device=network.device)
     new_pos = ((route_len + 1) * new_pos_floats).to(int)
 
     # insert nodes at the new positions
     inplace_insert_node_at(route, new_pos, new_node)
 
-    scenario[route_idx] = route
+    network[route_idx] = route
     check_for_inner_negs(route)
-    return scenario
+    return network
 
 
-def heuristic_1(scenario, *args, **kwargs):
+def heuristic_1(network, *args, **kwargs):
     """delete a random node from a random route"""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
+    assert network.ndim == 2, "batched networks not supported yet!"
 
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
-    route_lens = (scenario != -1).sum(dim=-1)
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
+    route_lens = (network != -1).sum(dim=-1)
     route_len = route_lens[route_idx][0]
     if route_len == 0:
-        # can't delete, just return the existing scenario
-        return scenario
-    target_node = torch.randint(route_len, (1,), device=scenario.device)
-    route = scenario[route_idx][0]
+        # can't delete, just return the existing network
+        return network
+    target_node = torch.randint(route_len, (1,), device=network.device)
+    route = network[route_idx][0]
     inplace_remove_stop_at(route, target_node)
 
-    scenario[route_idx] = route
+    network[route_idx] = route
     check_for_inner_negs(route)
-    return scenario
+    return network
 
 
-def heuristic_2(scenario, *args, **kwargs):
+def heuristic_2(network, *args, **kwargs):
     """swap two random nodes in a random route"""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
-    route_len = (scenario != -1).sum(dim=-1)[route_idx]
+    assert network.ndim == 2, "batched networks not supported yet!"
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
+    route_len = (network != -1).sum(dim=-1)[route_idx]
     # pick nodes to swap
-    dev = scenario.device
+    dev = network.device
     if route_len < 2:
-        # can't swap, just return the existing scenario
-        return scenario
+        # can't swap, just return the existing network
+        return network
     
     node_idxs = torch.ones(route_len, device=dev).\
         multinomial(2, replacement=False)
 
     # swap nodes
-    route = scenario[route_idx][0]
+    route = network[route_idx][0]
     old_node = route[node_idxs[0]]
     route[node_idxs[0]] = route[node_idxs[1]]
     route[node_idxs[1]] = old_node
 
-    scenario[route_idx] = route
+    network[route_idx] = route
     check_for_inner_negs(route)
-    return scenario
+    return network
 
 
-def heuristic_3(scenario, *args, **kwargs):
+def heuristic_3(network, *args, **kwargs):
     """move a random node to a random new position in a random route"""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
-    route_len = (scenario != -1).sum(dim=-1)[route_idx]
+    assert network.ndim == 2, "batched networks not supported yet!"
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
+    route_len = (network != -1).sum(dim=-1)[route_idx]
     if route_len < 2:
-        # can't move any nodes, just return the existing scenario
-        return scenario
+        # can't move any nodes, just return the existing network
+        return network
     # pick nodes to swap
-    dev = scenario.device
+    dev = network.device
     old_node_pos, new_node_pos = torch.ones(route_len, device=dev).\
         multinomial(2, replacement=False)
-    old_node = scenario[route_idx, old_node_pos]
-    route = scenario[route_idx][0]
+    old_node = network[route_idx, old_node_pos]
+    route = network[route_idx][0]
     inplace_remove_stop_at(route, old_node_pos)
     inplace_insert_node_at(route, new_node_pos, old_node)
 
-    scenario[route_idx] = route
+    network[route_idx] = route
     check_for_inner_negs(route)
 
-    return scenario
+    return network
 
 
-def heuristic_4(scenario, state, *args, **kwargs):
+def heuristic_4(network, state, *args, **kwargs):
     """replace a random node in a random route with another random node"""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
-    route_lens = (scenario != -1).sum(dim=-1)
+    assert network.ndim == 2, "batched networks not supported yet!"
+    route_lens = (network != -1).sum(dim=-1)
 
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device)
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device)
     route_len = route_lens[route_idx][0]
     if route_len == 0:
-        # can't replace anything, just return the existing scenario
-        return scenario
-    replacement_idx = torch.randint(route_len, (1,), device=scenario.device)
+        # can't replace anything, just return the existing network
+        return network
+    replacement_idx = torch.randint(route_len, (1,), device=network.device)
 
     n_nodes_not_on_route = state.max_n_nodes - route_len
     if n_nodes_not_on_route == 0:
-        # can't replace with anything, just return the existing scenario
-        return scenario
+        # can't replace with anything, just return the existing network
+        return network
     new_node_subidx = torch.randint(state.max_n_nodes - route_len, (1,), 
-                                    device=scenario.device)
-    route = scenario[route_idx][0]
+                                    device=network.device)
+    route = network[route_idx][0]
     unused_nodes = list(set(range(state.max_n_nodes)) - set(route.tolist()))
     new_node = unused_nodes[new_node_subidx]
 
     route[replacement_idx] = new_node
 
-    scenario[route_idx] = route
+    network[route_idx] = route
     check_for_inner_negs(route)
-    return scenario
+    return network
 
 
-def heuristic_5(scenario, state, *args, **kwargs):
+def heuristic_5(network, state, *args, **kwargs):
     """select two random routes and a random position on each; move node at the 
         first pos on the first route to the second pos on the second route."""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
-    n_routes = scenario.shape[0]
+    assert network.ndim == 2, "batched networks not supported yet!"
+    n_routes = network.shape[0]
     if n_routes < 2:
         # makes no sense to swap nodes between two routes if there is only one
-        return scenario
+        return network
 
-    route_lens = (scenario != -1).sum(dim=-1)
+    route_lens = (network != -1).sum(dim=-1)
     can_shrink = route_lens > 2
     if not can_shrink.any():
-        return scenario
+        return network
     route1_idx = can_shrink.to(float).multinomial(1)
 
     can_grow = route_lens < state.max_n_nodes
     if not can_grow.any():
-        return scenario
+        return network
     route2_idx = can_grow.to(float).multinomial(1)
 
-    route1 = scenario[route1_idx][0]
-    route2 = scenario[route2_idx][0]
+    route1 = network[route1_idx][0]
+    route2 = network[route2_idx][0]
     route1_len = (route1 != -1).sum(dim=-1)
     route2_len = (route2 != -1).sum(dim=-1)
-    node1_idx = (torch.rand(1, device=scenario.device) * route1_len).to(int)
-    node2_idx = (torch.rand(1, device=scenario.device) * route2_len).to(int)
+    node1_idx = (torch.rand(1, device=network.device) * route1_len).to(int)
+    node2_idx = (torch.rand(1, device=network.device) * route2_len).to(int)
     old_node_1 = route1[node1_idx[0]]
     assert old_node_1 >= 0
     inplace_insert_node_at(route2, node2_idx, old_node_1)
@@ -724,45 +728,45 @@ def heuristic_5(scenario, state, *args, **kwargs):
     check_for_inner_negs(route1)
     check_for_inner_negs(route2)
 
-    scenario[route1_idx] = route1
-    scenario[route2_idx] = route2
-    return scenario
+    network[route1_idx] = route1
+    network[route2_idx] = route2
+    return network
 
 
-def heuristic_6(scenario, *args, **kwargs):
+def heuristic_6(network, *args, **kwargs):
     """select two random routes and a random node on each, and swap those two 
         nodes."""
-    assert scenario.ndim == 2, "batched scenarios not supported yet!"
-    n_routes = scenario.shape[0]
+    assert network.ndim == 2, "batched networks not supported yet!"
+    n_routes = network.shape[0]
     if n_routes < 2:
         # makes no sense to swap nodes between two routes if there is only one
-        return scenario
-    dist = torch.ones(n_routes, device=scenario.device)
+        return network
+    dist = torch.ones(n_routes, device=network.device)
     route_idxs = dist.multinomial(2, replacement=False)
-    old_scenario = scenario.clone()
-    routes = old_scenario[route_idxs]
+    old_network = network.clone()
+    routes = old_network[route_idxs]
     route_lens = (routes != -1).sum(dim=-1)
     if 0 in route_lens:
-        # can't swap any nodes, just return the existing scenario
-        return scenario
-    node_idxs = (torch.rand(2, device=scenario.device) * route_lens).to(int)
+        # can't swap any nodes, just return the existing network
+        return network
+    node_idxs = (torch.rand(2, device=network.device) * route_lens).to(int)
     old_node_1 = routes[0, node_idxs[0]].item()
     old_node_2 = routes[1, node_idxs[1]].item()
 
-    scenario[route_idxs[0], node_idxs[0]] = old_node_2
-    scenario[route_idxs[1], node_idxs[1]] = old_node_1
-    check_for_inner_negs(scenario[route_idxs[0]])
-    check_for_inner_negs(scenario[route_idxs[1]])
-    return scenario
+    network[route_idxs[0], node_idxs[0]] = old_node_2
+    network[route_idxs[1], node_idxs[1]] = old_node_1
+    check_for_inner_negs(network[route_idxs[0]])
+    check_for_inner_negs(network[route_idxs[1]])
+    return network
 
 
-def heuristic_bee1(scenario, state, shortest_paths, *args, **kwargs):
+def heuristic_bee1(network, state, shortest_paths, *args, **kwargs):
     # select a route
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device).squeeze()
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device).squeeze()
     # select which terminal will be kept
     keep_start = torch.rand(1) > 0.5
-    route = scenario[route_idx]
+    route = network[route_idx]
     if keep_start:
         kept_node = route[0]
         options = shortest_paths[kept_node]
@@ -779,26 +783,26 @@ def heuristic_bee1(scenario, state, shortest_paths, *args, **kwargs):
     options = options[is_valid]
     selection_idx = torch.randint(options.shape[0], (1,)).squeeze()
     new_route = options[selection_idx]
-    scenario[route_idx, :len(new_route)] = new_route
+    network[route_idx, :len(new_route)] = new_route
 
-    return scenario
+    return network
 
 
-def heuristic_bee2(scenario, state, *args, **kwargs):
+def heuristic_bee2(network, state, *args, **kwargs):
     # shorten, same as in BCO
     # select a route at random
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device).squeeze()
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device).squeeze()
 
     # select which terminal will be modified
     modify_start = torch.rand(1) > 0.5
 
-    route = scenario[route_idx]
+    route = network[route_idx]
     route_len = (route != -1).sum()
     can_shorten = len(route) > state.min_route_len[0]
     if not can_shorten:
         # we can't modify this route, so just leave it
-        return scenario
+        return network
     else:
         # cut off the chosen end
         if modify_start:
@@ -809,22 +813,22 @@ def heuristic_bee2(scenario, state, *args, **kwargs):
          # to remove or it's a duplicate after the shift
         route[route_len - 1] = -1
 
-    # add the modified route back to the scenario
-    scenario[route_idx] = route
-    return scenario
+    # add the modified route back to the network
+    network[route_idx] = route
+    return network
 
 
-def heuristic_bee3(scenario, state, *args, **kwargs):
+def heuristic_bee3(network, state, *args, **kwargs):
     # extend, same as in BCO
     # select a route at random
-    n_routes = scenario.shape[0]
-    route_idx = torch.randint(n_routes, (1,), device=scenario.device).squeeze()
+    n_routes = network.shape[0]
+    route_idx = torch.randint(n_routes, (1,), device=network.device).squeeze()
 
     # select which terminal will be modified
     modify_start = torch.rand(1) > 0.5
-    extend_choices = torch.ones(state.max_n_nodes, device=scenario.device)
+    extend_choices = torch.ones(state.max_n_nodes, device=network.device)
     # don't add any duplicate routes
-    route = scenario[route_idx]
+    route = network[route_idx]
     route_len = (route != -1).sum()
     extend_choices[route[:route_len]] = 0.0
 
@@ -832,7 +836,7 @@ def heuristic_bee3(scenario, state, *args, **kwargs):
         route_len < state.max_route_len[0]
     if not can_extend:
         # we can't modify this route, so just leave it
-        return scenario
+        return network
     else:
         # add a random node at the chosen end
         extension = extend_choices.to(dtype=torch.float32).multinomial(1)
@@ -842,13 +846,13 @@ def heuristic_bee3(scenario, state, *args, **kwargs):
         else:
             route[route_len] = extension
 
-    # add the modified route back to the scenario
-    scenario[route_idx] = route
-    return scenario
+    # add the modified route back to the network
+    network[route_idx] = route
+    return network
 
 
-def noop_heuristic(scenario, *args, **kwargs):
-    return scenario
+def noop_heuristic(network, *args, **kwargs):
+    return network
 
 
 def check_for_inner_negs(route):
@@ -889,21 +893,18 @@ def main(cfg: DictConfig):
         "Must provide either n_iterations or duration_s in config!"
     n_steps = cfg.get('n_iterations', None)
     duration_s = cfg.get('duration_s', None)
-    draw = cfg.eval.get('draw', False)
 
     # TODO load the model and pass it in if the config file specifies it.
 
     routes = \
-        lrnu.test_method(hyperheuristic, test_dl, cfg.eval.n_routes, 
-        cfg.eval.min_route_len, cfg.eval.max_route_len, cost_fn, 
+        lrnu.test_method(hyperheuristic, test_dl, cfg.eval, cfg.init, cost_fn, 
         sum_writer=sum_writer, silent=False, duration_s=duration_s, 
-        n_steps=n_steps, f_0=cfg.f_0, init_model=model, device=DEVICE, 
-        csv=cfg.eval.csv, draw=draw, return_routes=True)[-1]
+        n_steps=n_steps, f_0=cfg.f_0, device=DEVICE, return_routes=True)[-1]
     if type(routes) is not torch.Tensor:
         routes = get_batch_tensor_from_routes(routes)
 
     # save the final routes that were produced
-    lrnu.dump_routes(run_name, routes.cpu())
+    dump_routes(run_name, routes.cpu())
 
 
 if __name__ == "__main__":

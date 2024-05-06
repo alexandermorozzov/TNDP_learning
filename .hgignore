@@ -39,3 +39,9 @@ commit.txt
 
 # ignore temporary backup files
 *.bak
+
+# ignore temporary git repo
+*.git
+
+# ignore figure directory
+figs

@@ -15,8 +15,6 @@
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
-import logging as log
-
 from omegaconf import DictConfig
 import hydra
 
@@ -36,9 +34,8 @@ def main(cfg: DictConfig):
     test_dl = DataLoader(test_ds, batch_size=cfg.batch_size)
 
     # evaluate the model on the dataset
-    lrnu.test_method(None, test_dl, cfg.eval, cost_fn, silent=False, 
-                     init_solution_file=cfg.routes, device=DEVICE, 
-                     return_routes=True)
+    lrnu.test_method(None, test_dl, cfg.eval, cfg.init, cost_fn, silent=False, 
+                     device=DEVICE, return_routes=True)
 
 
 if __name__ == "__main__":

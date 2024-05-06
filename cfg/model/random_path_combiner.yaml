@@ -7,6 +7,7 @@ route_generator:
   type: RandomPathCombiningRouteGenerator
   kwargs:
     force_linking_unlinked: false
+    halt_prob_is_route_time_weight: false
     logit_clip: null
 
 backbone_gn:

@@ -6,6 +6,3 @@ kwargs:
   n_halt_layers: 3
   halt_scorer_type: "endpoints"
   # n_halt_heads: 4
-  serial_halting: true
-  route_by_route: false
-  halt_scorer_type: 'endpoints'

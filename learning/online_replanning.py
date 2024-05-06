@@ -77,7 +77,7 @@ class BCOPlanner(Planner):
     def _update_plan_inner(self, plan, city_graph):
         return bee_colony(city_graph, self.n_routes, self.min_route_len,
                           self.max_route_len, self.cost_obj, 
-                          init_scenario=plan, silent=True, 
+                          init_network=plan, silent=True, 
                           **self.cfg.online_planner.bco)[0]
     
     def get_update_size(self):
@@ -95,7 +95,7 @@ class NeuralBCOPlanner(Planner):
     def _update_plan_inner(self, plan, city_graph):
         return bee_colony(city_graph, self.n_routes, self.min_route_len,
                           self.max_route_len, self.cost_obj, 
-                          init_scenario=plan, bee_model=self.model,
+                          init_network=plan, bee_model=self.model,
                           silent=True, **self.cfg.online_planner.neural_bco)[0]
 
     def get_update_size(self):

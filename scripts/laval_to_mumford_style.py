@@ -4,19 +4,40 @@ from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
+import torch
 import networkx as nx
 import pandas as pd
 import pyproj
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
+from torch_geometric.data import Data
+from torch_geometric.transforms import KNNGraph, RemoveIsolatedNodes
+import torch_geometric.utils as pygu
 
 from simulation.citygraph_dataset import CityGraphData
 
 
-def from_shapefile_and_csv(shapefile_path, gtfs_path, demand_csv_path, 
-                           basin_radius_m=500, beeline_dist_factor=1.3, 
-                           edge_threshold_minutes=5, mapframe="EPSG:32188"):
+def from_census_tracts(demand_csv_path, mapframe="EPSG:32188"):
+    demands_df = pd.read_csv(demand_csv_path)
+    locs_in_census_tract = defaultdict(list)
+    tf = pyproj.Transformer.from_crs("EPSG:3348", mapframe)
+    for _, row in demands_df.iterrows():
+        orig = tf.transform(row['t_orix'], row['t_oriy'])
+        locs_in_census_tract[row['t_orict']].append((orig))
+        dest = tf.transform(row['t_desx'], row['t_desy'])
+        locs_in_census_tract[row['t_desct']].append((dest))
+
+    centroids = {}
+    for ct, poss in locs_in_census_tract.items():
+        centroids[ct] = np.mean(poss, axis=0)
+
+    # TODO resume here.
+    
+
+def from_xml_and_csv(shapefile_path, gtfs_path, demand_csv_path, 
+                     basin_radius_m=500, beeline_dist_factor=1.3, 
+                     edge_threshold_minutes=5, mapframe="EPSG:32188"):
     # load stops
     stops_path = Path(gtfs_path) / "stops.txt"
     stops_df = pd.read_csv(stops_path)
@@ -203,13 +224,13 @@ def main():
     args = parser.parse_args()
 
     log.basicConfig(level=log.INFO)
-    from_shapefile_and_csv(args.shapefile_path,
-                            args.gtfs_path,
-                            args.demand_csv_path,
-                            basin_radius_m=args.br,
-                            beeline_dist_factor=args.bdf,
-                            edge_threshold_minutes=args.et,
-                            )
+    from_xml_and_csv(args.shapefile_path,
+                     args.gtfs_path,
+                     args.demand_csv_path,
+                     basin_radius_m=args.br,
+                     beeline_dist_factor=args.bdf,
+                     edge_threshold_minutes=args.et,
+                     )
 
     cgd = CityGraphData.from_mumford_data('.', 'Laval', 
                                           scale_dynamically=False)

@@ -30,11 +30,12 @@ from omegaconf import DictConfig
 import matplotlib.pyplot as plt
 
 from learning import models
-from torch.nn import DataParallel
+from learning.initialization import init_from_cfg
 from simulation.transit_time_estimator import NikolicCostModule, MyCostModule,\
     RouteGenBatchState
 from simulation.drawing import draw_coalesced_routes, plot_routes_in_groups
 from simulation.citygraph_dataset import STOP_KEY
+from torch_utils import load_routes_tensor
 
 
 PM_TERMSFIRST = "termsfirst"
@@ -66,10 +67,11 @@ def build_model_from_cfg(cfg):
 
     low_mem_mode = cfg.experiment.get('low_memory_mode', False)
 
-    model = gen_class(backbone_gn, mean_stop_time_s, 
-        symmetric_routes=cfg.experiment.symmetric_routes,
-        low_memory_mode=low_mem_mode, **cfg.model.common, 
-        **cfg.model.route_generator.kwargs)
+    model = gen_class(backbone_net=backbone_gn, 
+                      mean_stop_time_s=mean_stop_time_s, 
+                      symmetric_routes=cfg.experiment.symmetric_routes,
+                      low_memory_mode=low_mem_mode, **cfg.model.common, 
+                      **cfg.model.route_generator.kwargs)
                 
     return model
 
@@ -189,12 +191,12 @@ def log_stops_per_route(batch_routes, sum_writer, ep_count, prefix=''):
     no_batch = type(elem1) is int or \
         (type(elem1) is torch.Tensor and elem1.ndim == 0)
     if no_batch:
-        # add a batch around this single scenario
+        # add a batch around this single network
         batch_routes = [batch_routes]
     route_lens = [[len(rr) for rr in routes] for routes in batch_routes]
-    avg_stops_per_scenario = [torch.tensor(rls, dtype=float).mean() 
+    avg_stops_per_network = [torch.tensor(rls, dtype=float).mean() 
                               for rls in route_lens]
-    avg_stops = torch.stack(avg_stops_per_scenario).mean()
+    avg_stops = torch.stack(avg_stops_per_network).mean()
     sum_writer.add_scalar(prefix + ' # stops per route', avg_stops, ep_count)
 
 
@@ -213,14 +215,10 @@ def rewards_to_returns(rewards, discount_rate=1):
 
 
 @torch.no_grad()
-def test_method(method_fn, dataloader, eval_cfg, cost_obj, sum_writer=None, 
-                silent=False, init_solution_file=None, return_routes=False, 
+def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj, 
+                sum_writer=None, silent=False, return_routes=False, 
                 device=None, iter_num=0, *method_args, **method_kwargs):
-    if method_fn is None:
-        assert init_solution_file is not None, \
-            "must provide an initial solution file if no method is specified"
-    if method_fn is not None:
-        log.debug(f"evaluating {method_fn.__name__} on dataset")
+    log.debug(f"evaluating {method_fn.__name__} on dataset")
     cost_histories = []
     final_costs = []
     all_metrics = None
@@ -230,33 +228,34 @@ def test_method(method_fn, dataloader, eval_cfg, cost_obj, sum_writer=None,
             data = data.cuda()
         
         start_time = time.time()
-        init_solution = None
-        if init_solution_file is not None:
-            # load the initial solution from the file
-            init_solution = load_routes_tensor(init_solution_file, device)
-            assert init_solution.shape[1] == eval_cfg.n_routes, \
-                "initial solution has wrong number of routes "\
-                f"{init_solution.shape[1]}, should be {eval_cfg.n_routes}"
 
-        fixed_routes_file = eval_cfg.dataset.get('fixed_routes', None)
-        if fixed_routes_file is not None:
-            fixed_routes_path = Path(eval_cfg.dataset.path) / fixed_routes_file
-            # load the fixed routes from the file
-            fixed_routes = load_routes_tensor(fixed_routes_path, device)
-        else:
-            fixed_routes = None
+        fixed_routes = None
+        dataset = eval_cfg.get('dataset', None)
+        if dataset is not None:
+            fixed_routes_file = dataset.get('fixed_routes', None)
+            if fixed_routes_file is not None:
+                fixed_routes_path = Path(dataset.path) / fixed_routes_file
+                # load the fixed routes from the file
+                fixed_routes = load_routes_tensor(fixed_routes_path, device)
 
         state = RouteGenBatchState(data, cost_obj, eval_cfg.n_routes, 
                                    eval_cfg.min_route_len, 
                                    eval_cfg.max_route_len, 
                                    fixed_routes=fixed_routes)
+        
+        init_network = init_from_cfg(state, init_cfg)
+        assert init_network is None or init_network.shape[1] == eval_cfg.n_routes, \
+            "initial solution has wrong number of routes "\
+            f"{init_network.shape[1]}, should be {eval_cfg.n_routes}"
+
         if method_fn is not None:
             state, cost_history = method_fn(state, cost_obj, silent=silent,
-                                            init_scenario=init_solution,
+                                            init_network=init_network,
                                             sum_writer=sum_writer, *method_args, 
                                             **method_kwargs)
         else:
-            state.add_new_routes(init_solution)
+            # just evaluate the initial solution
+            state.add_new_routes(init_network)
             cost_history = None
         if eval_cfg.get('draw', False):
             for city, city_routes in zip(data.to_data_list(), state.routes):
@@ -330,33 +329,3 @@ def test_method(method_fn, dataloader, eval_cfg, cost_obj, sum_writer=None,
         return out_stats + (state.routes,)
     else:
         return out_stats
-
-
-def dump_routes(run_name, all_route_sets, out_dir='output_routes'):
-    """
-    run_name: a string to identify the run
-    all_route_sets: a list of tensors, the routes used for each city
-    """
-    if type(out_dir) is str:
-        out_dir = Path(out_dir)
-    if not out_dir.exists():
-        out_dir.mkdir()
-    out_path = out_dir / (run_name + '_routes.pkl')
-    if type(all_route_sets) is torch.Tensor:
-        # convert to a list of route sets for each city
-        if all_route_sets.ndim == 2:
-            all_route_sets = [all_route_sets]
-        elif all_route_sets.ndim == 3:
-            all_route_sets = [rs for rs in all_route_sets]
-
-    with out_path.open('wb') as ff:
-        pickle.dump(all_route_sets, ff)
-
-
-def load_routes_tensor(path, device=None):
-    if type(path) is str:
-        path = Path(path)
-    with path.open('rb') as ff:
-        route_sets = pickle.load(ff)
-    return torch.stack(route_sets, 0).to(device=device)
-    

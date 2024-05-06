@@ -4,4 +4,4 @@ kwargs:
   avg_transfer_wait_time_s: 300
   demand_time_weight: 1e-10
   route_time_weight: 1.0
-  constraint_violation_weight: 5.0
+  unserved_weight: 5.0

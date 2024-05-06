@@ -29,7 +29,7 @@ from simulation.citygraph_dataset import get_dataset_from_config
 from simulation.transit_time_estimator import RouteGenBatchState
 import learning.utils as lrnu
 from learning.eval_route_generator import sample_from_model
-from learning.bee_colony import get_direct_sat_dmd, build_init_scenario, \
+from learning.bee_colony import get_direct_sat_dmd, build_init_network, \
     get_bee_1_variants
 
 
@@ -91,7 +91,7 @@ def run(state, cost_obj, pop_size=10, shorten_prob=0.2, n_iterations=400,
     exp_states = [state] * pop_size
     init_states = RouteGenBatchState.batch_from_list(exp_states)
     if mut_model is None:
-        init_scenario = build_init_scenario(shortest_paths, demand, n_routes,
+        init_scenario = build_init_network(shortest_paths, demand, n_routes,
                                             cost_obj.symmetric_routes)  
         init_scenario = tensor_scenario_to_tuples(init_scenario)
         population = [copy.copy(init_scenario) for _ in range(pop_size)]
@@ -411,7 +411,7 @@ def main(cfg: DictConfig):
 
     nt1m = cfg.get('n_type1_mutators', cfg.population_size // 2)
     routes = \
-        lrnu.test_method(run, test_dl, cfg.eval, cost_fn, 
+        lrnu.test_method(run, test_dl, cfg.eval, cfg.init, cost_fn, 
             sum_writer=sum_writer, silent=False, pop_size=cfg.population_size, 
             n_iterations=cfg.n_iterations, n_type1_mut=nt1m, 
             init_model=init_model, device=DEVICE, mut_model=mut_model, 

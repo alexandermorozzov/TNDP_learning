@@ -31,8 +31,16 @@ from simulation.citygraph_dataset import get_dataset_from_config, \
 
 
 import matplotlib
-matplotlib.rcParams.update({'font.size': 20, 'pdf.fonttype': 42,
-                            'ps.fonttype': 42})
+# set up matplotlib and seaborn
+# matplotlib.rcParams['text.usetex'] = True
+# force type-1 fonts
+matplotlib.rcParams['ps.useafm'] = True
+matplotlib.rcParams['pdf.use14corefonts'] = True
+
+matplotlib.rcParams['figure.constrained_layout.use'] = True
+matplotlib.rcParams['font.size'] = 20
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['font.family'] = 'serif'
 
 
 def plot_routes(data, routes, show_demand=False, node_size=100, edge_size=10):
@@ -90,8 +98,10 @@ def plot_routes(data, routes, show_demand=False, node_size=100, edge_size=10):
             edge_col[0].set_label(str(route_id))
 
     plt.axis("on")
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     ax.tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-    # plt.xlabel("meters")
+    plt.xlabel("meters")
     plt.tight_layout()
     plt.show()
 
@@ -113,7 +123,7 @@ def main():
         # the dataset is nested in the eval config, so pull it out
         ds_cfg = ds_cfg.dataset
 
-    dataset = get_dataset_from_config(ds_cfg)
+    dataset = get_dataset_from_config(ds_cfg, center_nodes=False)
 
     if args.routes is None:
         # just plot the street graph
