@@ -62,11 +62,11 @@ This will ensure that all tests will be run before each commit, and the commit w
 If you make use of this code for academic work, please cite our associated conference paper, "Augmenting Transit Network Design Algorithms with Deep Learning":
 
 ```
-@Conference{holliday2023augmenting,
-    author = {Holliday, Andrew and Dudek, Gregory}, 
-    title  = {Augmenting Transit Network Design Algorithms with Deep Learning},
-    year   = {2023},
-    booktitle = {2023 26th IEEE International Conference on Intelligent Transportation Systems (ITSC)},
+@inproceedings{holliday2024autonomous,
+    author = {Holliday, Andrew and Dudek, Gregory},
+    title = {A Neural-Evolutionary Algorithm for Autonomous Transit Network Design},
+    year = {2024},
+    booktitle = {presented at 2024 IEEE International Conference on Robotics and Automation (ICRA)},
     organization = {IEEE}
 }
 ```
