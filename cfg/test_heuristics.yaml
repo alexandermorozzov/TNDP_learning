@@ -1,0 +1,6 @@
+defaults:
+  - _self_
+  - experiment: standard
+  - eval: mandl
+
+experiment.cpu: true

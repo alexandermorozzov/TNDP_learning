@@ -4,15 +4,13 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from aggregate_data import aggregate_and_preprocess_data
+from plotting_utils import aggregate_and_preprocess_data
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('data', nargs='+', 
                         help='path to csv file with data to format')
-    parser.add_argument('-v', '--value', default='cost',
-                        help='plot this value')
     parser.add_argument('--asymmetric', action='store_true', 
                         help="If provided, don't halve RTT")
     parser.add_argument('-o', help="prefix of files in which to save output")

@@ -35,7 +35,7 @@ from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.transforms import KNNGraph, RemoveIsolatedNodes, \
     BaseTransform, RandomRotate, RandomFlip, Compose
 
-from torch_utils import floyd_warshall
+import torch_utils as tu
 
 RAW_GRAPH_FILENAME = 'graph_list.pkl'
 
@@ -93,9 +93,19 @@ def get_dataset_from_config(ds_cfg, center_nodes=True):
     elif ds_cfg['type'] == 'mumford':
         do_scaling = ds_cfg.get('scale_dynamically', True)
         extra_node_feats = ds_cfg.get('extra_node_feats', True)
+
+        fixed_routes_file = ds_cfg.get('fixed_routes', None)
+        if fixed_routes_file is not None:
+            fixed_routes_path = Path(ds_cfg.path) / fixed_routes_file
+            # load the fixed routes from the file
+            fixed_routes = tu.load_routes_tensor(fixed_routes_path)
+        else:
+            fixed_routes = None
+
         data = CityGraphData.from_mumford_data(ds_cfg.path, ds_cfg.city,
             scale_dynamically=do_scaling, extra_node_feats=extra_node_feats,
-            center_nodes=center_nodes)
+            fully_connected_demand=True, center_nodes=center_nodes, 
+            fixed_routes=fixed_routes)
         return [data]
     else:
         raise ValueError(f"Unknown dataset type {ds_cfg['type']}")
@@ -103,7 +113,7 @@ def get_dataset_from_config(ds_cfg, center_nodes=True):
 
 def get_dynamic_training_set(min_nodes, max_nodes, space_scale, demand_scale, 
                              edge_keep_prob=0.7, data_type='mixed', 
-                             directed=False, fully_connected_demand=False):
+                             directed=False, fully_connected_demand=True):
     transforms = [
         SpaceScaleTransform(1-space_scale, 1+space_scale), 
         DemandScaleTransform(1-demand_scale, 1+demand_scale),
@@ -140,8 +150,8 @@ class CityGraphDataset(InMemoryDataset):
 class DynamicCityGraphDataset(torch.utils.data.IterableDataset):
     def __init__(self, min_nodes, max_nodes, edge_keep_prob=0.7, 
                  data_type='mixed', directed=False, 
-                 fully_connected_demand=False, side_length_m=SIDE_LENGTH_M, 
-                 transforms=None, mumford_style=False, pos_only=True):
+                 fully_connected_demand=True, side_length_m=SIDE_LENGTH_M, 
+                 transforms=None, mumford_style=True, pos_only=False):
         super().__init__()
         self.data_type = data_type
         self.edge_keep_prob = edge_keep_prob
@@ -188,8 +198,12 @@ class DynamicCityGraphDataset(torch.utils.data.IterableDataset):
             graph = self.transform(graph)
             yield graph
 
-    def generate_graph(self, draw=False):
-        n_nodes = random.randint(self.min_nodes, self.max_nodes)
+    def generate_graph(self, draw=False, n_nodes=None, max_n_nodes=None):
+        if not max_n_nodes:
+            max_n_nodes = self.max_nodes
+        if not n_nodes:
+            n_nodes = random.randint(self.min_nodes, max_n_nodes)
+        assert n_nodes <= max_n_nodes
 
         # build a street graph with nodes in (-1, 1)
         street_graph = self._generate_street_graph(n_nodes)
@@ -198,6 +212,8 @@ class DynamicCityGraphDataset(torch.utils.data.IterableDataset):
         street_graph.pos = street_graph.pos * self.side_length_m / 2
 
         graph = CityGraphData()
+        fixed_routes = torch.zeros((0, max_n_nodes))
+        graph.fixed_routes = fixed_routes
         graph[STOP_KEY].pos = street_graph.pos
         graph[STREET_KEY].edge_index = street_graph.edge_index
         
@@ -209,14 +225,14 @@ class DynamicCityGraphDataset(torch.utils.data.IterableDataset):
         edge_times = euc_dists[street_idx[0], street_idx[1]] / SPEED_MPS
         graph[STREET_KEY].edge_attr = edge_times[:, None]
 
-        street_edge_mat = torch.full((self.max_nodes, self.max_nodes), 
+        street_edge_mat = torch.full((max_n_nodes, max_n_nodes), 
                                      float('inf'))
         street_edge_mat[street_idx[0], street_idx[1]] = edge_times
         street_edge_mat.fill_diagonal_(0)
         graph.street_adj = street_edge_mat
 
         # compute all shortest paths
-        nexts, times = floyd_warshall(street_edge_mat)
+        nexts, times = tu.floyd_warshall(street_edge_mat)
         graph.drive_times = times.squeeze(0)
         graph.nexts = nexts.squeeze(0)
 
@@ -252,7 +268,7 @@ class DynamicCityGraphDataset(torch.utils.data.IterableDataset):
             plt.show()
 
         # pad the demand matrix to the max size
-        n_pad = self.max_nodes - n_nodes
+        n_pad = max_n_nodes - n_nodes
         demand = torch.nn.functional.pad(demand, (0, n_pad, 0, n_pad))
         graph.demand = demand
         if self.fully_connected_demand:
@@ -390,12 +406,45 @@ class CityGraphData(HeteroData):
             nx.draw_networkx_edges(nx_dmd_graph, edge_color="red", 
                                 pos=locs, width=de_widths,
                                 style='dashed', ax=ax)
-    
+            
+    @staticmethod
+    def from_tensors(node_locs, street_adj, demand, pos_only=False):
+        graph = CityGraphData()
+        n_nodes = node_locs.shape[0]
+        graph.fixed_routes = torch.zeros((0, n_nodes))
+        graph[STOP_KEY].pos = node_locs
+        is_edge = (street_adj > 0) & street_adj.isfinite()
+        edge_idx = is_edge.nonzero().t()
+        graph[STREET_KEY].edge_index = edge_idx
+        graph[STREET_KEY].edge_attr = street_adj[is_edge]
+        graph.street_adj = street_adj
+
+        # compute all shortest paths
+        nexts, times = tu.floyd_warshall(street_adj)
+        graph.drive_times = times.squeeze(0)
+        graph.nexts = nexts.squeeze(0)
+
+        # compute demand features
+        graph.demand = demand
+        demand_nonzeros = demand.nonzero()
+        graph[DEMAND_KEY].edge_index = demand_nonzeros.t()
+        dmd_feats = demand[demand_nonzeros[:, 0], demand_nonzeros[:, 1]]
+        drive_times = times[0, demand_nonzeros[:, 0], demand_nonzeros[:, 1]]
+        graph[DEMAND_KEY].edge_attr = torch.stack((dmd_feats, drive_times))
+
+        if pos_only:
+            graph[STOP_KEY].x = torch.zeros((n_nodes, 0))
+        else:
+            graph[STOP_KEY].x = get_node_features(edge_idx, demand)
+            
+        return graph
+        
     @staticmethod
     def from_mumford_data(instances_dir, instance_name='', 
                           assumed_speed_mps=SPEED_MPS,
                           scale_dynamically=True, extra_node_feats=True,
-                          center_nodes=True):
+                          fully_connected_demand=True, center_nodes=True, 
+                          fixed_routes=None):
         """
         instances_dir: the directory where the Mumford data is stored.
         instance_name: for the instances given in the Mumford dataset, this
@@ -438,6 +487,10 @@ class CityGraphData(HeteroData):
 
         # convert this to our graph representation
         data = CityGraphData()
+        if fixed_routes is None:
+            fixed_routes = torch.zeros((0, node_locs.shape[0]))
+
+        data.fixed_routes = fixed_routes
         # load demands from demands file
         dmd_path = data_dir / (instance_name + 'Demand.txt')
         od = torch.tensor(np.genfromtxt(dmd_path), dtype=torch.float32)
@@ -457,21 +510,28 @@ class CityGraphData(HeteroData):
         data.street_adj = street_edge_times_s
         
         # compute all shortest paths
-        nexts, drive_times = floyd_warshall(street_edge_times_s)
+        nexts, drive_times = tu.floyd_warshall(street_edge_times_s)
         drive_times = drive_times.squeeze(0)
         data.drive_times = drive_times
         data.nexts = nexts.squeeze(0)
 
         # compute demand features
         has_demand = od > 0
-        demand_feat = od[has_demand]
-        dd_feat = drive_times[has_demand]
-        dmd_edge_feat = torch.stack((demand_feat, dd_feat), dim=1)
-        dmd_idx = torch.stack(torch.where(has_demand))
+ 
+        if fully_connected_demand:
+            n_nodes = od.shape[0]
+            dmd_idx = torch.tensor(list(permutations(range(n_nodes), 2))).T
+        else:
+            dmd_idx = torch.stack(torch.where(has_demand))
 
         data[DEMAND_KEY].edge_index = dmd_idx
+        demand_feat = od[dmd_idx[0], dmd_idx[1]]
+        drive_time_feat = drive_times[dmd_idx[0], dmd_idx[1]]
+        dmd_edge_feat = torch.stack((demand_feat, drive_time_feat), dim=1)
         data[DEMAND_KEY].edge_attr = dmd_edge_feat
         data.demand = od
+
+        assert data.fixed_routes is not None
         return data
 
     @property

@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import seaborn as sns
 
 
 HEADER_NAMES = ['$\\alpha$', '# routes', 'cost', 'ATT', 'RTT', '$d_0$', 
@@ -22,30 +23,81 @@ PAPER_NAME_MAP = {
 }
 
 
+HUE_ORDER = ['NEA', 'EA', 'LC-100', 'LC-Greedy', 'LC-40k', 'all-1 NEA', 
+             '$\pi_{\\theta_{\\alpha = 1}}$ NEA', 'RC-EA', 'NREA', 'TF', 'STL', 
+             '$\pi_{\\theta_{\\alpha = 1}}$ LC-100', 'RC-100', 'RCa-100',
+             'Nikolić (2013)', 'Ahmed (2019)', 'John (2014)']
+
+
+def set_tufte_spines(ax, xmin=None, xmax=None, ymin=None, ymax=None):
+    """Make the spines of the axes look like Edward Tufte's plots.
+    
+    Remove the top and right spines, and make the left and bottom spines 
+    into range plots."""
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    if xmin is not None or xmax is not None:
+        ax.spines['bottom'].set_bounds(xmin, xmax)
+    if ymin is not None or ymax is not None:
+        ax.spines['left'].set_bounds(ymin, ymax)
+
+
+def get_dict_palette(args):
+    """Allows arguments to specify the colours in the palette that different
+    methods are plotted in."""
+    palette_colours = sns.color_palette()
+    if not args.named_colour:
+        return None
+    else:
+        return {name: palette_colours[ii] 
+                for ii, name in enumerate(args.named_colour)}
+
+
 def assign_method(df, filename):
     # add a column to each dataframe with the method name
-    if filename.startswith('bco'):
+    # method names for the initialization experiments
+    if filename.startswith('init_'):
+        post_init_fn = filename.partition('init_')[-1]
+        if post_init_fn.startswith('ea_plain') or \
+            post_init_fn.startswith('nikoli'):
+            df['Method'] = 'Nikolić (2013)'
+        elif post_init_fn.startswith('hh_plain') or \
+            post_init_fn.startswith('ahmed'):
+            df['Method'] = 'Ahmed (2019)'
+        elif 'john' in post_init_fn:
+            df['Method'] = 'John (2014)'
+        elif 's100' in post_init_fn:
+            df['Method'] = 'LC-100'
+        elif 'greedy' in post_init_fn:
+            df['Method'] = 'LC-Greedy'
+
+    # method names for non-initialization experiments
+    elif filename.startswith('bco'):
         df['Method'] = 'EA'
     elif 'neural_bco_no2' in filename:
         df['Method'] = 'all-1 NEA'
     elif filename.startswith('neural_bco_random'):
-        df['Method'] = 'PC-EA'
+        df['Method'] = 'RC-EA'
     elif filename.startswith('neural_bco_short'):
         df['Method'] = 'NEA (short)'
+    elif filename.startswith('neural_bco_pptrained'):
+        df['Method'] = '$\pi_{\\theta_{\\alpha = 1}}$ NEA'
+    elif filename.startswith('neural_bco_ppo'):
+        df['Method'] = 'PPO NEA'
     elif filename.startswith('neural_bco') or filename.startswith('nbco'):
         df['Method'] = 'NEA'
     elif filename.startswith('s40k'):
         df['Method'] = 'LC-40k'
     elif filename.startswith('s100_pp'):
-        df['Method'] = 'LC-100, $\\alpha = 1$ policy'
+        df['Method'] = '$\pi_{\\theta_{\\alpha = 1}}$ LC-100'
     elif filename.startswith('s100_op'):
-        df['Method'] = 'LC-100 $\\alpha = 0$ policy'
+        df['Method'] = '$\pi_{\\theta_{\\alpha = 0}}$ LC-100'
     elif filename.startswith('s100'):
         df['Method'] = 'LC-100'
     elif filename.startswith('greedy_pp'):
-        df['Method'] = 'LC-Greedy $\\alpha = 1$ policy'
+        df['Method'] = '$\pi_{\\theta_{\\alpha = 1}}$ LC-Greedy'
     elif filename.startswith('greedy_op'):
-        df['Method'] = 'LC-Greedy $\\alpha = 0$ policy'
+        df['Method'] = '$\pi_{\\theta_{\\alpha = 0}}$ LC-Greedy'
     elif filename.startswith('greedy'):
         df['Method'] = 'LC-Greedy'
     elif filename.startswith('tf'):

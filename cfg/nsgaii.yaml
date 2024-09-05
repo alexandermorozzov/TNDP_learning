@@ -1,0 +1,23 @@
+# Husselmann's settings for NSGA-II
+n_iterations: 2000
+pop_size: 400
+p_crossover: 0.9
+p_mutation: 0.9
+mutator_p_t: 0.03
+init_mode: model
+
+use_cost_based_heuristics: true
+use_model_heuristics: true
+
+defaults:
+  - experiment: standard
+  - model@rpc_model: random_path_combiner
+  - model@model_1: bestsofar_feb2023
+  # - model@model_2: bestsofar_feb2023
+  - override experiment/cost_function: multi
+  - _self_
+
+rpc_model:
+  route_generator:
+    kwargs:
+      halt_prob_is_route_time_weight: true

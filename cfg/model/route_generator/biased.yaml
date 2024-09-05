@@ -6,3 +6,4 @@ kwargs:
   n_halt_layers: 3
   halt_scorer_type: "endpoints"
   # n_halt_heads: 4
+  serial_halting: true

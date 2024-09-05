@@ -26,11 +26,11 @@ from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig, OmegaConf
 import hydra
 
-from torch_utils import reconstruct_all_paths, floyd_warshall, \
-    get_route_edge_matrix, get_batch_tensor_from_routes, \
-    get_route_leg_times, get_unselected_routes, dump_routes
 from simulation.citygraph_dataset import get_dataset_from_config
+from simulation.transit_time_estimator import count_duplicate_stops, \
+    count_skipped_stops
 import learning.utils as lrnu
+import torch_utils as tu
 
 
 """
@@ -121,7 +121,7 @@ def hyperheuristic(state, cost_obj, f_0, delta_F=None, duration_s=None,
     batch_size = state.batch_size
 
     # create the initial network
-    shortest_paths, _ = reconstruct_all_paths(state.nexts.cpu())
+    shortest_paths, _ = tu.reconstruct_all_paths(state.nexts.cpu())
     max_n_nodes = state.max_n_nodes
     demand = torch.zeros((batch_size, max_n_nodes+1, max_n_nodes+1), 
                          device=dev)
@@ -397,24 +397,15 @@ def count_violations(network, n_nodes, required_n_routes, sp_lens,
     n_uncovered = n_nodes - is_covered[:, :-1].sum(dim=-1)
     assert (n_uncovered >= 0).all()
 
-    # count duplicate stops in routes
-    n_duplicates = torch.zeros((batch_size,), dtype=torch.long, 
-                               device=network.device)
-    for bi, batch_elem in enumerate(network):
-        for route in batch_elem:
-            valid_route = route[route > -1]
-            n_unique = valid_route.unique().shape[0]
-            n_stops = valid_route.shape[0]
-            n_duplicates[bi] += n_stops - n_unique
-
+    n_duplicates = count_duplicate_stops(n_nodes, network)
     n_violations = n_uncovered + n_duplicates
     assert (n_duplicates >= 0).all()
 
     # count un-connected vertices.  If more than 2 transfers, doesn't count.
     dummy_dtm = torch.ones((batch_size, n_nodes + 1, n_nodes + 1),
                            device=network.device)
-    route_matrix = get_route_edge_matrix(network, dummy_dtm, 0,
-                                         symmetric_routes=symmetric_routes)
+    route_matrix = tu.get_route_edge_matrix(network, dummy_dtm, 0,
+                                            symmetric_routes=symmetric_routes)
 
     # direct_link = route_matrix.isfinite().float()
     # upto1transfer = direct_link.bmm(direct_link)
@@ -424,7 +415,7 @@ def count_violations(network, n_nodes, required_n_routes, sp_lens,
 
     # run floyd-warshall
     route_matrix = route_matrix[:, :-1, :-1]
-    _, dists = floyd_warshall(route_matrix)
+    _, dists = tu.floyd_warshall(route_matrix)
 
     # for each pair of nodes with no path, add one
     unconnected = dists.isinf() & (demand > 0)
@@ -458,11 +449,7 @@ def count_violations(network, n_nodes, required_n_routes, sp_lens,
     # count how many edges routes are away from being valid.  This isn't 
      # explicit in the paper but based on the results, and then on 
      # correspondence with one of the authors, it is what they do.
-    path_n_skips = sp_lens - 2
-    path_n_skips.clamp_(min=0)
-    leg_n_skips = get_route_leg_times(network, path_n_skips)
-    total_n_skips = leg_n_skips.sum(dim=(1, 2))
-    assert (total_n_skips >= 0).all()
+    total_n_skips = count_skipped_stops(network, sp_lens)
     n_violations += total_n_skips
 
     return n_violations
@@ -556,7 +543,7 @@ def neural_heuristic(network, state, model, *args, **kwargs):
     # drop a random route
     n_routes = network.shape[0]
     route_idx = torch.randint(n_routes, (1,), device=network.device)
-    remaining_network = get_unselected_routes(network[None], route_idx)
+    remaining_network = tu.get_unselected_routes(network[None], route_idx)
     state.replace_routes(remaining_network)
     result = model.step(state, greedy=False)
     return result.routes_tensor[0]
@@ -901,10 +888,10 @@ def main(cfg: DictConfig):
         sum_writer=sum_writer, silent=False, duration_s=duration_s, 
         n_steps=n_steps, f_0=cfg.f_0, device=DEVICE, return_routes=True)[-1]
     if type(routes) is not torch.Tensor:
-        routes = get_batch_tensor_from_routes(routes)
+        routes = tu.get_batch_tensor_from_routes(routes)
 
     # save the final routes that were produced
-    dump_routes(run_name, routes.cpu())
+    tu.dump_routes(run_name, routes.cpu())
 
 
 if __name__ == "__main__":

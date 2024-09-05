@@ -1,12 +1,13 @@
 import logging as log
 
 import torch
+from tqdm import tqdm
 import networkx as nx
 
 from torch_utils import get_batch_tensor_from_routes, load_routes_tensor, \
     aggr_edges_over_sequences, reconstruct_all_paths
 from simulation.transit_time_estimator import RouteGenBatchState
-
+import learning.utils as lrnu
 
 def init_from_cfg(state, init_cfg):
     """Initializes the network according to the configuration.
@@ -33,8 +34,9 @@ def init_from_cfg(state, init_cfg):
     # TODO bring in hyperheuristic initialization scheme
 
 
-def john_init(batch_state: RouteGenBatchState, alpha: float, 
-              prioritize_direct_connections: bool = True):
+def john_init(state: RouteGenBatchState, alpha=None, 
+              prioritize_direct_connections: bool=True,
+              show_pbar=False):
     """Constructs a network based on the algorithm of John et al. (2014).
     
     Args:
@@ -42,48 +44,53 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
         alpha: Controls trade-off between transit time and demand. alpha=1
             means only demand matters, alpha=0 means only transit time matters.
     """
-    assert batch_state.symmetric_routes, 'John et al. (2014) requires symmetric routes'
+    assert state.symmetric_routes, \
+        'John et al. (2014) requires symmetric routes'
+    assert state.batch_size == 1, \
+        'John et al. (2014) does not support batched states'
 
     # compute weights for all of the edges
-    norm_times = batch_state.drive_times / batch_state.drive_times.max()
-    norm_demand = batch_state.demand / batch_state.demand.max()
-    beta = 1 - alpha
+    have_edges = (state.street_adj > 0) & state.street_adj.isfinite()
+    norm_times = torch.full_like(state.street_adj, float('inf'))
+    edge_times = state.street_adj[have_edges]
+    norm_times[have_edges] = edge_times / edge_times.max()
+    norm_demand = state.demand / state.demand.max()
+    if alpha is None:
+        # use John's spread of alpha and beta values
+        values = torch.linspace(0, 1, 21)
+        meshes = torch.meshgrid(values, values, indexing='ij')
+        alpha, beta = (mm.flatten()[:, None, None] for mm in meshes)
+    else:
+        # just use the one passed-in value
+        beta = 1 - alpha
+    # build the range of edge weight sets based on alpha and beta
     all_edge_costs = beta * norm_times + alpha * (1 - norm_demand)
-    have_edges = batch_state.street_adj.isfinite() & \
-        (batch_state.street_adj > 0)
     all_edge_costs[~have_edges] = float('inf')
 
-    if batch_state.batch_size > 1:
-        states = batch_state.unbatch()
-    else:
-        states = [batch_state]
-
     # build a spanning sub-graph of routes
+    have_edges = have_edges.squeeze(0)
     networks = []
-    for edge_costs, state in zip(all_edge_costs, states):
+    for edge_costs in tqdm(all_edge_costs, disable=not show_pbar):
         network = []
-        has_edges = state.street_adj.isfinite() & (state.street_adj > 0)
-        has_edges = has_edges.squeeze(0)
-        n_nodes = state.nodes_per_scenario[0].item()
+        n_nodes = state.n_nodes[0].item()
         are_visited = torch.zeros(n_nodes, dtype=torch.bool, 
                                   device=state.device)
         are_directly_connected = torch.eye(n_nodes, dtype=torch.bool, 
                                            device=state.device)
-
+        pair_attempted = torch.eye(n_nodes, dtype=torch.bool, 
+                                   device=state.device)
         # While all nodes are not yet visited:
         while not are_visited.all():
             # select a "seed pair" of vertices to be the start of the route
-            if len(network) == 0:
-                # first iteration, we can choose any edge
-                scores = edge_costs
-            else:
+            scores = edge_costs.clone()
+            if len(network) > 0:
                 # choose an edge between a covered and an uncovered node
                 connects_new = are_visited[:, None] & ~are_visited
-                # add the max edge cost to pairs that don't connect a new node,
-                 # so they can't get chosen by the argmin later
-                scores = edge_costs.clone()
-                scores[~connects_new] = edge_costs.max() + 1
-                # scores = edge_costs + ~connects_new * (edge_costs.max() + 1)
+                # don't pick pairs that don't connect a new node
+                scores[~connects_new] = float('inf')
+            
+            # don't choose any pairs that have already been attempted
+            scores[pair_attempted] = float('inf')
 
             flat_seed_pair = torch.argmin(scores).item()
             seed_pair = (flat_seed_pair // n_nodes,
@@ -92,20 +99,19 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
             are_on_route = torch.zeros(n_nodes, dtype=torch.bool,
                                        device=state.device)
             are_on_route[[seed_pair]] = True
-            are_visited[[seed_pair]] = True
 
             # expand the seed pair to form a route by adding adjacent vertices
             while len(route) < state.max_route_len:
                 # find valid extension nodes
-                are_valid_start_exts = has_edges[route[0]] & ~are_on_route
-                are_valid_end_exts = has_edges[route[-1]] & ~are_on_route
+                are_valid_start_exts = have_edges[route[0]] & ~are_on_route
+                are_valid_end_exts = have_edges[route[-1]] & ~are_on_route
                 
                 # check if any of them are not yet visited at all
                 are_valid_exts = are_valid_start_exts | are_valid_end_exts
                 if not are_valid_exts.any():
                     # no valid extensions, so we're done
                     break
-
+                
                 if (are_valid_exts & ~are_visited).any():
                     # we can visit an unvisited node, so we must do so
                     are_valid_start_exts &= ~are_visited
@@ -131,22 +137,21 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
                 
                 # mark the node as on the route and visited
                 are_on_route[chosen_node] = True
-                are_visited[chosen_node] = True
 
             # route is finished
             if len(route) >= state.min_route_len:
                 # route is long enough to add
                 route = torch.tensor(route)
-                # mark the route's nodes as directly connected
+                # mark the route's nodes as visited and directly connected
                 are_directly_connected[route, route] = True
+                are_visited |= are_on_route
                 network.append(route)
+
+            pair_attempted[seed_pair] = True
 
             if len(network) == state.n_routes_to_plan:
                 # we have enough routes, so we're done
                 break
-
-        if not are_visited.all() and len(network) == state.n_routes_to_plan:
-            raise RuntimeError('Failed to span the graph')
 
         if len(network) < state.n_routes_to_plan:
             # Use approach of Shih and Mahmassani to add more routes
@@ -157,25 +162,27 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
                 pair_demands = state.demand[0, ~are_directly_connected]
             else:
                 pair_demands = state.demand[0]
-                nodepairs = torch.nonzero(torch.ones_like(pair_demands))
+                nodepairs = torch.combinations(torch.arange(n_nodes), r=2)
 
             sorted_indices = pair_demands.flatten().argsort(descending=True)
-            sorted_pairs = nodepairs[sorted_indices]
+            sorted_pairs = [(ss.item(), dd.item())
+                            for ss, dd in nodepairs[sorted_indices]]
 
             # build a networkx graph
-            adj_mat = state.street_adj[0].cpu()
-            adj_mat[adj_mat.isinf()] = 0
-            graph = nx.from_numpy_matrix(adj_mat.numpy())
+            edge_costs[state.street_adj[0].isinf()] = 0
+            graph = nx.from_numpy_matrix(edge_costs.numpy())
 
             # add the existing routes to the graph to get the transit times
             state.add_new_routes([network])
 
             # For each pair in order, until $|\mathcal{R}| = S$:
             for (src, dst) in sorted_pairs:
+
                 # Use Yen's k-shortest path algorithm (see ref. 22) with k=10 
                  # to see if a valid route between the nodes exists that 
                  # doesn't violate any constraints
-                paths = yen_k_shortest_paths(graph, src.item(), dst.item(), 10)
+                paths = lrnu.yen_k_shortest_paths(graph, src, dst, 10)
+    
                 for path in paths:
                     # check if the path is valid
                     if state.min_route_len <= len(path) <= state.max_route_len \
@@ -188,6 +195,8 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
                             # add the path and move on to the next node pair
                             path = torch.tensor(path)
                             network.append(path)
+                            are_visited[path] = True
+
                             state.add_new_routes([[path]])
                             break                
 
@@ -196,86 +205,24 @@ def john_init(batch_state: RouteGenBatchState, alpha: float,
                     break
 
         if len(network) < state.n_routes_to_plan:
-            raise RuntimeError('Failed to find enough routes')
+            # raise RuntimeError('Failed to find enough routes')
+            log.warning('John init failed to find enough routes')
+        if not are_visited.all():
+            # raise RuntimeError('Failed to cover all nodes')
+            log.warning('John init failed to cover all nodes')
+        else:
+            networks.append(network)
 
-        networks.append(network)
+        # make sure changes to state don't affect the original state
+        state.clear_routes()
 
-    # make sure changes to state don't affect the original state
-    batch_state.clear_routes()
-    networks = get_batch_tensor_from_routes(networks, state.device)
-
-    return networks
-
-
-def yen_k_shortest_paths(graph: nx.Graph, src_index: int, dst_index: int, 
-                         kk: int):
-    """Yen's k-shortest paths algorithm for a graph.
+    if len(networks) == 0:
+        raise RuntimeError('John init failed to find any valid networks')
+        
+    networks = get_batch_tensor_from_routes(networks, state.device, 
+                                            state.max_route_len[0])
+    return networks      
     
-    Args:
-        graph: The graph to find paths in.
-        src_index: The index of the source node.
-        dst_index: The index of the destination node.
-    
-    Returns:
-        A list of the k shortest paths from the source to the destination.
-    """
-    shortest = nx.dijkstra_path(graph, src_index, dst_index)
-    k_shortest = [shortest]
-    prev_path = shortest
-
-    potential_paths = []
-    ptnl_path_costs = []
-    for _ in range(kk - 1):
-        prev_path = k_shortest[-1]
-        for jj in range(len(prev_path) - 1):
-            # spur node is the j-th node in the previous path
-            spur_node = prev_path[jj]
-            root_path = prev_path[:jj + 1]
-
-            graph_copy = graph.copy()
-            for path in k_shortest:
-                if root_path == path[:jj + 1]:
-                    # remove the links that are part of the previous shortest 
-                     # paths which share the same root path, so they won't
-                     # be taken again
-                    try:
-                        graph_copy.remove_edge(path[jj], path[jj + 1])
-                    except nx.NetworkXError:
-                        # the edge has already been removed. that's fine.
-                        pass
-            
-            # remove nodes before the spur node so the next shortest path won't
-             # go along them
-            for node in root_path:
-                if node != spur_node:
-                    graph_copy.remove_node(node)
-            
-            # calculate the spur path from the spur node to the destination
-            try:
-                spur_path = nx.dijkstra_path(graph_copy, spur_node, dst_index)
-            except nx.NetworkXNoPath:
-                continue
-            
-            # the root path followed by the spur path is another potential path
-            total_path = root_path[:-1] + spur_path
-            if total_path not in potential_paths:
-                potential_paths.append(total_path)
-                ptnl_path_costs.append(nx.path_weight(graph, total_path, 
-                                                      weight='weight'))
-
-        if not potential_paths:
-            # there are no remaining spur paths to try
-            break
-
-        # choose the lowest cost path
-        min_cost = min(ptnl_path_costs)
-        min_cost_index = ptnl_path_costs.index(min_cost)
-        path = potential_paths.pop(min_cost_index)
-        ptnl_path_costs.pop(min_cost_index)
-        k_shortest.append(path)
-
-    return k_shortest
-
 
 def nikolic_init(state: RouteGenBatchState):
     """Constructs a network based on the algorithm of Nikolic and Teodorovic 

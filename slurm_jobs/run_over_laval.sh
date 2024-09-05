@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=rrg-dpmeger
-#SBATCH --time=20:00:00
+#SBATCH --time=40:00:00
 #SBATCH --gpus-per-node=1
 #SBATCH --mem-per-cpu=5000M
 #SBATCH --array=0-29
@@ -82,14 +82,7 @@ python learning/bee_colony.py --config-name neural_bco_mumford \
     experiment.seed=$seed +run_name=nea_$base_run_name +model.weights=$model \
     experiment.logdir=$SLURM_TMPDIR/tb_logs force_linking_unlinked=true \
     +init_solution_file=$init_soln_file >> $out_dir/neural_bco_laval_$alpha.csv
-# NREA
-python learning/bee_colony.py --config-name nrea_mumford \
-    hydra/job_logging=disabled eval.dataset.path=$dataset_dir +eval=lavalDA \
-    experiment.cost_function.kwargs.demand_time_weight=$alpha \
-    experiment.cost_function.kwargs.route_time_weight=$beta \
-    experiment.seed=$seed +run_name=nea_$base_run_name +model.weights=$model \
-    experiment.logdir=$SLURM_TMPDIR/tb_logs force_linking_unlinked=true \
-    +init_solution_file=$init_soln_file >> $out_dir/neural_bco_laval_$alpha.csv
+
 # random "NEA"
 # first use it to generate a starting solution...
 python learning/eval_route_generator.py hydra/job_logging=disabled \

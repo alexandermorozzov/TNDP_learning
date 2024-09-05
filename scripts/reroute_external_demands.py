@@ -65,10 +65,20 @@ LAVAL_EXITS = {
 
 def reroute_external_demands(in_od_path, out_od_path):
     od_df = pd.read_csv(in_od_path)
+
+    n_valid = 0
+    n_within = 0
+    n_redirected = 0
+
     # for each trip:
     for row_idx, row in od_df.iterrows():
         ori_csd = parse_census_code(row["t_oricsd"])[1]
         des_csd = parse_census_code(row["t_descsd"])[1]
+        if ori_csd > 0 and des_csd > 0:
+            n_valid += row['t_expf']
+        else:
+            continue
+
         end_csds = set((ori_csd, des_csd))
         is_intercity = LAVAL_CSD in end_csds and len(end_csds) > 1
 
@@ -79,14 +89,20 @@ def reroute_external_demands(in_od_path, out_od_path):
                  row["t_mode7"], row["t_mode8"], row["t_mode9"])
         uses_transit = len(CAR_CODES & set(modes)) == 0 and \
             len(TRANSIT_CODES & set(modes)) > 0
+        
+        if not is_intercity:
+            n_within += row['t_expf']
 
-        # if the trip starts or ends outside laval and uses transit:
         if is_intercity and uses_transit:
+            n_redirected += row['t_expf']
+            # the trip starts or ends outside laval and uses transit
             # - retreive the set of "exit" coordinates based on the code and 
-             # whether it's origin or destination
+             # whether it is origin or destination
             if ori_csd != LAVAL_CSD and ori_csd in LAVAL_EXITS:
+                # it enters Laval
                 cross_coords = LAVAL_EXITS[ori_csd]["in"]
             elif des_csd in LAVAL_EXITS:
+                # it exits Laval
                 cross_coords = LAVAL_EXITS[des_csd]["out"]
             else:
                 # the external csd isn't in our remapping dict, so just skip it
@@ -100,7 +116,7 @@ def reroute_external_demands(in_od_path, out_od_path):
                                             distances.shape)
 
             # remap row's external endpoint to the exit coordinate which is 
-             # closest to any endpoint
+             # closest to either endpoint, not just the external one
             new_coord = cross_coords[cross_idx]
             if ori_csd != LAVAL_CSD:
                 od_df.loc[row_idx, "t_orix"] = new_coord[0]
@@ -110,6 +126,10 @@ def reroute_external_demands(in_od_path, out_od_path):
                 od_df.loc[row_idx, "t_desy"] = new_coord[1]
 
     od_df.to_csv(out_od_path, index=False)
+
+    print(f"Valid trips: {n_valid}")
+    print(f"Trips within Laval: {n_within}")
+    print(f"Trips redirected: {n_redirected}")
 
 
 if __name__ == "__main__":

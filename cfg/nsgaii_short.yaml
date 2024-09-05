@@ -1,0 +1,15 @@
+# Mumford's and John's settings for NSGA-II
+n_iterations: 200
+pop_size: 200
+p_crossover: 0.9
+p_mutation: 0.9
+mutator_p_t: 0.03
+init_mode: model
+
+# init_model: model/bestsofar_feb2023
+
+defaults:
+  - _self_
+  - experiment: standard
+  - model: bestsofar_feb2023
+  - override experiment/cost_function: multi

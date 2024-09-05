@@ -5,8 +5,9 @@ lr: 0.0016134816080499328
 decay: 0.0008404361781997002
 optimizer: Adam
 baseline_mode: neural
-discount_rate: null
+discount_rate: 1.0
 entropy_weight: 0.0
+diff_reward: true
 
 eval:
   min_route_len: 2

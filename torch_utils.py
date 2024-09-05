@@ -32,9 +32,11 @@
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
-import torch
 from pathlib import Path
 import pickle
+from typing import Tuple
+
+import torch
 
 # currently unused, but might be useful in the future
 def batch_2combinations(sequences):
@@ -86,7 +88,7 @@ def get_update_at_mask(tensor, mask, new_value=0):
 
     # add singleton dimensions to the mask as needed for the below arithmetic
     while mask.ndim < tensor.ndim:
-        mask.unsqueeze_(-1)
+        mask = mask.unsqueeze(-1)
     updated = tensor * ~mask + new_value * mask
 
     return updated
@@ -488,6 +490,11 @@ def aggr_edges_over_sequences(seqs_tensor, edge_features, agg_mode="sum",
 
 
 def get_route_leg_times(batch_routes, drive_times_matrix, mean_stop_time_s=0):
+    add_route_dim = batch_routes.ndim == 2
+    if add_route_dim:
+        # add a route dimension
+        batch_routes = batch_routes[:, None]
+
     batch_idxs = torch.arange(batch_routes.shape[0], 
                               device=batch_routes.device)
     # batch_size x n_routes x route_len - 1
@@ -501,6 +508,9 @@ def get_route_leg_times(batch_routes, drive_times_matrix, mean_stop_time_s=0):
     leg_times += mean_stop_time_s
     invalid_leg_mask = (batch_routes == -1)[..., 1:]
     leg_times = get_update_at_mask(leg_times, invalid_leg_mask)
+    if add_route_dim:
+        # remove the extra dimension we added from the output
+        leg_times.squeeze_(1)
     return leg_times
 
 
@@ -610,7 +620,7 @@ def get_route_interstop_times(leg_times):
     return inter_stop_dists
 
 
-def get_batch_tensor_from_routes(routes, device=None):
+def get_batch_tensor_from_routes(routes, device=None, max_route_len=None):
     """
     Given a list or list of lists of routes, return an equivalent batched route
     tensor. Dummy elements will have value -1.
@@ -631,11 +641,13 @@ def get_batch_tensor_from_routes(routes, device=None):
     if device is None and isinstance(routes[0][0], torch.Tensor):
         device = routes[0][0].device
         
-    scen_tensors = [get_tensor_from_varlen_lists(sr)[0] for sr in batch_routes]
+    scen_tensors = [get_tensor_from_varlen_lists(sr, device)[0] 
+                    for sr in batch_routes]
     batch_size = len(scen_tensors)
     max_n_routes = max([st.shape[0] for st in scen_tensors])
-    max_n_stops = max([st.shape[1] for st in scen_tensors])
-    batch_tensor = torch.full((batch_size, max_n_routes, max_n_stops), -1)
+    if not max_route_len:
+        max_route_len = max([st.shape[1] for st in scen_tensors])
+    batch_tensor = torch.full((batch_size, max_n_routes, max_route_len), -1)
     for bi, st in enumerate(scen_tensors):
         batch_tensor[bi, :st.shape[0], :st.shape[1]] = st
     return batch_tensor.to(device=device)
@@ -645,9 +657,12 @@ def get_tensor_from_varlen_lists(lists, device=None, add_dummy=False):
     """Converts a list of lists or 1D tensors with possibly-variable lengths
         into a single 2D tensor and a mask indicating which entries of the
         tensor are padding values."""
-    max_list_len = max([len(rr) for rr in lists])
     tensor_len = len(lists)
-    if device is None and type(lists[0]) is torch.Tensor:
+    if len(lists) > 0:
+        max_list_len = max([len(rr) for rr in lists])
+    else:
+        max_list_len = 0
+    if device is None and len(lists) > 0 and type(lists[0]) is torch.Tensor:
         device = lists[0].device
     if add_dummy:
         tensor_len += 1
@@ -676,6 +691,27 @@ def get_unselected_routes(networks, selected_idxs):
     # get the unselected routes and return them
     unselected_routes = networks.gather(-2, unselected_idxs)
     return unselected_routes
+
+
+def get_nodes_on_routes_mask(n_nodes, networks):
+    """Returns an n_networks x n_routes x n_nodes+1 tensor of booleans,
+       where T_ijk = True where node i is on route j in network k, False 
+       otherwise."""
+    if networks.ndim == 2:
+        networks = networks[None]
+    n_networks = networks.shape[0]
+    n_routes = networks.shape[1]
+
+    are_nodes_on_route = torch.zeros((n_networks, n_routes, n_nodes+1),
+                                     dtype=bool, device=networks.device)
+    # replace -1 dummy elements with n_nodes, so they work with scatter
+    scatter_networks = networks.clone()
+    scatter_networks[scatter_networks == -1] = n_nodes
+    # set the nodes on the routes to True
+    are_nodes_on_route.scatter_(2, scatter_networks, True)
+    # set the dummy node to False, it's not "on" any node
+    are_nodes_on_route[..., -1] = False
+    return are_nodes_on_route
 
 
 def dump_routes(run_name, all_route_sets, out_dir='output_routes'):
@@ -790,3 +826,30 @@ def _make_all_indices_positive(dim_size, indices):
 def _get_forward_slice_mask(dim, rng, idxs):
     is_start_idx = rng == idxs.unsqueeze(dim)
     return is_start_idx.cumsum(dim).to(bool)
+
+
+def unravel_indices(
+    indices: torch.LongTensor,
+    shape: Tuple[int, ...],
+) -> torch.LongTensor:
+    r"""Converts flat indices into unraveled coordinates in a target shape.
+
+    Args:
+        indices: A tensor of (flat) indices, (*, N).
+        shape: The targeted shape, (D,).
+
+    Returns:
+        The unraveled coordinates, (*, N, D).
+    """
+
+    coord = []
+
+    for dim in reversed(shape):
+        coord.append(indices % dim)
+        # indices = indices // dim
+        # use this form instead to silence the warning about deprecation
+        indices = torch.div(indices, dim, rounding_mode='floor')
+
+    coord = torch.stack(coord[::-1], dim=-1)
+
+    return coord

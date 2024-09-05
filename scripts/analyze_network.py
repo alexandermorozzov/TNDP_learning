@@ -17,16 +17,19 @@
 
 import time
 import datetime
+import logging as log
 from pathlib import Path
-import numpy as np
 from collections import defaultdict
 from itertools import combinations, cycle
+
+import numpy as np
 from matplotlib.collections import LineCollection
 import matplotlib.pyplot as plt
 from scipy import spatial
 import networkx as nx
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Point
 import pyproj
 from scipy.spatial.distance import cdist
 
@@ -631,6 +634,9 @@ def transit_distance_statistics(demand_csv, gtfs_path,
         loc = (row["stop_lat"], row["stop_lon"])
         stop_locs.append(transformer.transform(*loc))
 
+    unique_locs = np.array(list(set(stop_locs)))
+    stop_locs = group_locs_by_threshold(unique_locs, 100)
+
     demands_df = pd.read_csv(demand_csv)
     demands_df = filter_demand_by_time(demands_df, start_time, end_time)
 
@@ -663,19 +669,24 @@ def transit_distance_statistics(demand_csv, gtfs_path,
     labels, heights = zip(*mode_counts.items())
     plt.bar(x_inds, heights)
     plt.xticks(x_inds, labels)
+    plt.title('Mode counts')
     plt.show()
     
     # show histogram of distances between ori/dest and first/last stop 
     start_locs = np.array(start_locs)
     end_locs = np.array(end_locs)
+    # distance of each trip start to the nearest stop
     start_dists = cdist(stop_locs, start_locs).min(axis=0)
+    # distance of each trip end to the nearest stop
     end_dists = cdist(stop_locs, end_locs).min(axis=0)
     start_pctls = np.percentile(start_dists, [5, 75, 85])
-    print("start dist percentiles:", start_pctls)
+    print("trip-start-to-nearest-stop dist percentiles:", start_pctls)
     end_pctls = np.percentile(end_dists, [50, 75, 85])
-    print("end dist percentiles:", end_pctls)
-    plt.hist(start_dists, label="start distances", bins=20, histtype='step')
-    plt.hist(end_dists, label="end distances", bins=20, histtype='step')
+    print("trip-end-to-nearest-stop dist percentiles:", end_pctls)
+    plt.hist(start_dists, label="trip-start-to-nearest-stop distances", 
+             bins=20, histtype='step')
+    plt.hist(end_dists, label="trip-end-to-nearest-stop distances", 
+             bins=20, histtype='step')
     plt.legend()
     plt.show()
 
@@ -683,6 +694,8 @@ def transit_distance_statistics(demand_csv, gtfs_path,
     trip_dists = np.linalg.norm(start_locs - end_locs, axis=1)
     plt.scatter(trip_dists, start_dists, label="starts")
     plt.scatter(trip_dists, end_dists, label="ends")
+    plt.xlabel("trip distance")
+    plt.ylabel("distance to nearest stop")
     plt.legend()
     plt.show()
 
@@ -697,30 +710,10 @@ def draw_gtfs_routes_on_network(network_path, gtfs_path, mapframe="EPSG:3348"):
             edge_color='black', arrows=False)
 
     # draw routes with real stops
-    stops_path = Path(gtfs_path) / "stops.txt"
-    stops_df = pd.read_csv(stops_path)
-    stop_locs = {}
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", mapframe)
-    for _, row in stops_df.iterrows():
-        loc = (row["stop_lat"], row["stop_lon"])
-        stop_locs[row["stop_id"]] = transformer.transform(*loc)
-    
-    trips_df = pd.read_csv(gtfs_path / "trips.txt")
-    stop_times_df = pd.read_csv(gtfs_path / "stop_times.txt")
-    # filter out stops with invalid times (< 00:00:00 or >= 24:00:00)
-    deptimes = pd.to_datetime(stop_times_df["departure_time"], errors='coerce')
-    arrtimes = pd.to_datetime(stop_times_df["arrival_time"], errors='coerce')
-    times_are_valid = ~(deptimes.isnull() | arrtimes.isnull())
-    stop_times_df = stop_times_df[times_are_valid]
-
-    start_time = datetime.time(hour=7)
-    end_time = datetime.time(hour=9)
-    stops_on_routes, _ = \
-        get_gtfs_route_stops_and_freqs(trips_df, stop_times_df, start_time, 
-                                       end_time, "AOUT13SEM")
+    stop_locs = get_stop_locs(gtfs_path, mapframe)
+    stops_on_routes = get_gtfs_routes(gtfs_path)
 
     # translate routes from lists of stop_ids to lists of stop locations
-    labelled_routes = set()
     routes_df = pd.read_csv(gtfs_path / "routes.txt")
     for _, row in routes_df.iterrows():
         route_id = row["route_id"]
@@ -746,6 +739,89 @@ def draw_gtfs_routes_on_network(network_path, gtfs_path, mapframe="EPSG:3348"):
     plt.show()
 
 
+def get_dissemination_area_routes(gtfs_path, shapefile_path,
+                                  shpframe='EPSG:3347'):
+    # build a dictionary mapping stop locations to dissemination areas
+    stop_locs = get_stop_locs(gtfs_path, shpframe)
+    gdf = gpd.read_file(shapefile_path)
+    stops_to_DAs = {}
+    for stop_id, stop_loc in stop_locs.items():
+        contains = gdf.geometry.contains(Point(*stop_loc))
+        if contains.any():
+            containing_poly_idx = contains.argmax()
+            stops_to_DAs[stop_id] = containing_poly_idx
+
+    stops_on_routes = get_gtfs_routes(gtfs_path)
+    DA_routes = {}
+    # translate routes from lists of stop_ids to lists of DAs
+    for route_id, route_stop_ids in stops_on_routes.items():
+        DA_route = []
+        for stop_id in route_stop_ids:
+            try:
+                DA = stops_to_DAs[stop_id]
+                # don't add the stop if it's just a repeat in the same DA
+                if len(DA_route) == 0 or DA_route[-1] != DA:
+                    DA_route.append(DA)
+            except KeyError:
+                pass
+        
+        delta = len(DA_route) - len(set(DA_route))
+        if delta > 0:
+            log.warning(f"route {route_id} has repeated DAs! {delta}")
+                
+        DA_routes[route_id] = DA_route
+
+    da_route_lens = [len(set(route)) for route in DA_routes.values()]
+    print(max(da_route_lens), min(da_route_lens), np.mean(da_route_lens),
+          np.median(da_route_lens))
+
+    return DA_routes
+
+
+def get_stop_locs(gtfs_path, mapframe=None):
+    stops_path = Path(gtfs_path) / "stops.txt"
+    stops_df = pd.read_csv(stops_path)
+    stop_locs = {}
+    if mapframe is not None:
+        transformer = pyproj.Transformer.from_crs("EPSG:4326", mapframe)
+    for _, row in stops_df.iterrows():
+        loc = (row["stop_lat"], row["stop_lon"])
+        if mapframe is not None:
+            loc = transformer.transform(*loc)
+        stop_locs[row["stop_id"]] = loc
+    return stop_locs
+
+
+def get_gtfs_routes(gtfs_path):
+    """returns a dict mapping route_id to a list of stop_ids."""
+    trips_df = pd.read_csv(gtfs_path / "trips.txt")
+    stop_times_df = pd.read_csv(gtfs_path / "stop_times.txt")
+    # filter out stops with invalid times (< 00:00:00 or >= 24:00:00)
+    deptimes = pd.to_datetime(stop_times_df["departure_time"], errors='coerce')
+    arrtimes = pd.to_datetime(stop_times_df["arrival_time"], errors='coerce')
+    times_are_valid = ~(deptimes.isnull() | arrtimes.isnull())
+    stop_times_df = stop_times_df[times_are_valid]
+
+    start_time = datetime.time(hour=7)
+    end_time = datetime.time(hour=9)
+    stops_on_routes, _ = \
+        get_gtfs_route_stops_and_freqs(trips_df, stop_times_df, start_time, 
+                                       end_time, "AOUT13SEM")
+    return stops_on_routes
+
+
+def group_locs_by_threshold(locs, threshold):
+    is_within_some_threshold = np.zeros(len(locs), dtype=bool)
+    dists = cdist(locs, locs)
+    kept_node_idxs = []
+    for ii, ii_dists in enumerate(dists):
+        if not is_within_some_threshold[ii]:
+            is_within_some_threshold |= ii_dists <= threshold
+            kept_node_idxs.append(ii)
+    kept_locs = locs[np.array(kept_node_idxs)]
+    return kept_locs
+
+
 if __name__ == "__main__":
     # carnet = "/home/andrew/matsim/my_envs/laval/generate/final_car_network.xml"
     # ptnet = "/home/andrew/matsim/my_envs/laval/network.xml"
@@ -753,17 +829,22 @@ if __name__ == "__main__":
     # ts = "/home/andrew/matsim/my_envs/laval/generate/final_ts.xml"
     # find_sametime_deps(ts)
     # sim_cfg_path = "/localdata/ahollid/transit_learning/simulation/laval_cfg.yaml"
-    network_path = Path("/usr/local/data/ahollid/laval/network.xml")
-    demand_path = Path("/usr/local/data/ahollid/laval/od_2013.csv")
+    laval_dir = Path("/usr/local/data/ahollid/laval")
+    network_path = laval_dir / "network.xml"
+    demand_path = laval_dir / "od_2013.csv"
+    gtfs_path = laval_dir / "gtfs_nov2013"
+    shapefile_path = laval_dir / "dissemination_areas"
+    
+    get_dissemination_area_routes(gtfs_path, shapefile_path)
+
+    transit_distance_statistics(demand_path, gtfs_path, 
+                                "07:00:00", "09:00:00")
     get_interzone_demand_stats(demand_path, "07:00:00", "09:00:00")
 
     draw_network_and_demands(network_path, demand_path)
 
-    gtfs_path = Path("/localdata/ahollid/laval/gtfs_nov2013")
     draw_gtfs_routes_on_network(network_path, gtfs_path)
 
-    transit_distance_statistics(demand_path, gtfs_path, 
-                                "07:00:00", "09:00:00")
     # count_laval_busriders(demand_path, "07:00:00", "09:00:00")
     check_gtfs_routes(gtfs_path, datetime.time(7), datetime.time(9))
     # check_gtfs_routes(gtfs_path, datetime.time(0), datetime.time(23,59,59))

@@ -20,19 +20,22 @@ from pathlib import Path
 import logging as log
 import time
 import random
-import pickle
+from itertools import count
+from heapq import heappush, heappop
 
+import hydra
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 from omegaconf import DictConfig
 import matplotlib.pyplot as plt
+import networkx as nx
 
 from learning import models
 from learning.initialization import init_from_cfg
-from simulation.transit_time_estimator import NikolicCostModule, MyCostModule,\
-    RouteGenBatchState
+from simulation.transit_time_estimator import RouteGenBatchState, \
+    get_cost_module_from_cfg
 from simulation.drawing import draw_coalesced_routes, plot_routes_in_groups
 from simulation.citygraph_dataset import STOP_KEY
 from torch_utils import load_routes_tensor
@@ -48,14 +51,13 @@ PM_COMB = "combiner"
 
 STOP_FEAT_DIM = 8
 
+def build_model_from_cfg(model_cfg, exp_cfg):
+    common_cfg = model_cfg.common
 
-def build_model_from_cfg(cfg):
-    common_cfg = cfg.model.common
+    backbone_gn = get_graphnet_from_cfg(model_cfg.backbone_gn, common_cfg)
 
-    backbone_gn = get_graphnet_from_cfg(cfg.model.backbone_gn, common_cfg)
-
-    mean_stop_time_s = cfg.experiment.cost_function.kwargs.mean_stop_time_s
-    gen_type = cfg.model.route_generator.type
+    mean_stop_time_s = exp_cfg.cost_function.kwargs.mean_stop_time_s
+    gen_type = model_cfg.route_generator.type
     if gen_type == "PathCombiningRouteGenerator":
         gen_class = models.PathCombiningRouteGenerator
     elif gen_type == "RandomPathCombiningRouteGenerator":
@@ -65,13 +67,13 @@ def build_model_from_cfg(cfg):
     elif gen_type == "NodeWalker":
         gen_class = models.NodeWalker
 
-    low_mem_mode = cfg.experiment.get('low_memory_mode', False)
+    low_mem_mode = exp_cfg.get('low_memory_mode', False)
 
     model = gen_class(backbone_net=backbone_gn, 
                       mean_stop_time_s=mean_stop_time_s, 
-                      symmetric_routes=cfg.experiment.symmetric_routes,
-                      low_memory_mode=low_mem_mode, **cfg.model.common, 
-                      **cfg.model.route_generator.kwargs)
+                      symmetric_routes=exp_cfg.symmetric_routes,
+                      low_memory_mode=low_mem_mode, **model_cfg.common, 
+                      **model_cfg.route_generator.kwargs)
                 
     return model
 
@@ -93,6 +95,14 @@ def get_graphnet_from_cfg(net_cfg, common_cfg):
     elif net_type == 'edge graph':
         return models.EdgeGraphNet(**common_cfg, **kwargs)
     assert False, f'Unknown net type {net_type}'
+
+
+def get_random_path_combiner():
+    # with hydra.initialize(version_base=None, config_path="cfg"):
+    cfg = hydra.compose(config_name='neural_bco_mumford.yaml',
+                        overrides=["model=random_path_combiner"])
+    model = build_model_from_cfg(cfg.model, cfg.experiment)
+    return model
 
 
 def log_config(cfg, sumwriter, prefix=''):
@@ -129,7 +139,7 @@ def process_standard_experiment_cfg(cfg, run_name_prefix='',
         log.info("not seeding random number generators")
 
     # determine the device
-    if exp_cfg.get('cpu', False):
+    if exp_cfg.get('cpu', False) or not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
         device = torch.device("cuda")
@@ -155,7 +165,7 @@ def process_standard_experiment_cfg(cfg, run_name_prefix='',
 
     if 'model' in cfg:
         # setup the model
-        model = build_model_from_cfg(cfg)
+        model = build_model_from_cfg(cfg['model'], exp_cfg)
         if 'weights' in cfg.model:
             model.load_state_dict(torch.load(cfg.model.weights,
                                              map_location=device))
@@ -167,16 +177,8 @@ def process_standard_experiment_cfg(cfg, run_name_prefix='',
 
     # setup the cost function
     low_mem_mode = exp_cfg.get('low_memory_mode', False)
-    if exp_cfg.cost_function.type == 'nikolic':
-        cost_obj = NikolicCostModule(low_memory_mode=low_mem_mode, 
-                                     symmetric_routes=exp_cfg.symmetric_routes,
-                                     **exp_cfg.cost_function.kwargs)
-    elif exp_cfg.cost_function.type == 'mine':
-        cost_obj = MyCostModule(low_memory_mode=low_mem_mode, 
-                                symmetric_routes=exp_cfg.symmetric_routes,
-                                min_route_len=cfg.eval.min_route_len,
-                                max_route_len=cfg.eval.max_route_len,
-                                **exp_cfg.cost_function.kwargs)
+    cost_obj = get_cost_module_from_cfg(exp_cfg.cost_function, low_mem_mode,
+                                        exp_cfg.symmetric_routes)
 
     # move torch objects to the device
     cost_obj.to(device)
@@ -218,7 +220,8 @@ def rewards_to_returns(rewards, discount_rate=1):
 def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj, 
                 sum_writer=None, silent=False, return_routes=False, 
                 device=None, iter_num=0, *method_args, **method_kwargs):
-    log.debug(f"evaluating {method_fn.__name__} on dataset")
+    if method_fn is not None:
+        log.debug(f"evaluating {method_fn.__name__} on dataset")
     cost_histories = []
     final_costs = []
     all_metrics = None
@@ -229,20 +232,10 @@ def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj,
         
         start_time = time.time()
 
-        fixed_routes = None
-        dataset = eval_cfg.get('dataset', None)
-        if dataset is not None:
-            fixed_routes_file = dataset.get('fixed_routes', None)
-            if fixed_routes_file is not None:
-                fixed_routes_path = Path(dataset.path) / fixed_routes_file
-                # load the fixed routes from the file
-                fixed_routes = load_routes_tensor(fixed_routes_path, device)
-
         state = RouteGenBatchState(data, cost_obj, eval_cfg.n_routes, 
                                    eval_cfg.min_route_len, 
-                                   eval_cfg.max_route_len, 
-                                   fixed_routes=fixed_routes)
-        
+                                   eval_cfg.max_route_len)
+
         init_network = init_from_cfg(state, init_cfg)
         assert init_network is None or init_network.shape[1] == eval_cfg.n_routes, \
             "initial solution has wrong number of routes "\
@@ -329,3 +322,129 @@ def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj,
         return out_stats + (state.routes,)
     else:
         return out_stats
+
+
+# -*- coding: utf-8 -*-
+"""
+Based on the implementation of Guilherme Maia <guilgermemm@gmail.com>
+A NetworkX based implementation of Yen's algorithm for computing K-shortest paths.   
+Yen's algorithm computes single-source K-shortest loopless paths for a 
+graph with non-negative edge cost. For more details, see: 
+http://en.m.wikipedia.org/wiki/Yen%27s_algorithm
+"""
+
+def yen_k_shortest_paths(graph, source, target, kk=1, weight='weight'):
+    """Returns the k-shortest paths from source to target in a weighted graph G.
+
+    Parameters
+    ----------
+    G : NetworkX graph
+
+    source : node
+       Starting node
+
+    target : node
+       Ending node
+       
+    k : integer, optional (default=1)
+        The number of shortest paths to find
+
+    weight: string, optional (default='weight')
+       Edge data key corresponding to the edge weight
+
+    Returns
+    -------
+    lengths, paths : lists
+       Returns a tuple with two lists.
+       The first list stores the length of each k-shortest path.
+       The second list stores each k-shortest path.  
+
+    Raises
+    ------
+    NetworkXNoPath
+       If no path exists between source and target.
+
+    Examples
+    --------
+    >>> G=nx.complete_graph(5)    
+    >>> print(k_shortest_paths(G, 0, 4, 4))
+    ([1, 2, 2, 2], [[0, 4], [0, 1, 4], [0, 2, 4], [0, 3, 4]])
+
+    Notes
+    ------
+    Edge weight attributes must be numerical and non-negative.
+    Distances are calculated as sums of weighted edges traversed.
+
+    """
+    if source == target:
+        return [[source]]
+       
+    length, path = nx.single_source_dijkstra(graph, source, target, weight=weight)
+        
+    lengths = [length]
+    paths = [path]
+    cc = count()        
+    BB = []                        
+    G_original = graph.copy()    
+    
+    for _ in range(1, kk):
+        for jj in range(len(paths[-1]) - 1):            
+            spur_node = paths[-1][jj]
+            root_path = paths[-1][:jj + 1]
+            
+            edges_removed = []
+            for c_path in paths:
+                if len(c_path) > jj and root_path == c_path[:jj + 1]:
+                    uu = c_path[jj]
+                    vv = c_path[jj + 1]
+                    if graph.has_edge(uu, vv):
+                        edge_attr = graph[uu][vv]
+                        graph.remove_edge(uu, vv)
+                        edges_removed.append((uu, vv, edge_attr))
+            
+            for n in range(len(root_path) - 1):
+                node = root_path[n]
+                # out-edges
+                node_edges = list(graph.edges(node, data=True))
+                for uu, vv, edge_attr in node_edges:
+                    graph.remove_edge(uu, vv)
+                    edges_removed.append((uu, vv, edge_attr))
+                
+                if graph.is_directed():
+                    # in-edges
+                    for uu, vv, edge_attr in graph.in_edges_iter(node, data=True):
+                        graph.remove_edge(uu, vv)
+                        edges_removed.append((uu, vv, edge_attr))
+            
+            try:
+                spur_path_length, spur_path = nx.single_source_dijkstra(graph, 
+                    spur_node, target, weight=weight)
+                total_path = root_path[:-1] + spur_path
+                total_path_length = get_path_length(G_original, root_path, weight) + spur_path_length                
+                heappush(BB, (total_path_length, next(cc), total_path))
+            except nx.NetworkXNoPath:
+                pass
+                
+            for e in edges_removed:
+                uu, vv, edge_attr = e
+                graph.add_edge(uu, vv, **edge_attr)
+                       
+        if BB:
+            (ll, _, pp) = heappop(BB)        
+            lengths.append(ll)
+            paths.append(pp)
+        else:
+            break
+    
+    return paths
+
+def get_path_length(G, path, weight='weight'):
+    length = 0
+    if len(path) > 1:
+        for i in range(len(path) - 1):
+            u = path[i]
+            v = path[i + 1]
+            
+            length += G[u][v].get(weight, 1)
+    
+    return length    

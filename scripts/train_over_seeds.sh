@@ -31,7 +31,6 @@ seeds=(
 for ((ii=0; ii<${#seeds[@]}; ii++))
 do
     seed=${seeds[$ii]}
-    python learning/inductive_route_learning.py \
-        --config-name bestsofar_20nodes +run_name=d32_seed_$seed \
-        experiment.seed=$seed model.common.embed_dim=32
+    python learning/inductive_route_learning.py +run_name=bigbatch_seed_$seed \
+        experiment.seed=$seed
 done

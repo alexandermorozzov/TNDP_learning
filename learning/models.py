@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
+import copy
 import logging as log
 import math
 from collections import namedtuple
@@ -25,15 +26,12 @@ from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.nn import (GATv2Conv, GCNConv, MessagePassing, SGConv,
                                 BatchNorm, GraphNorm)
-from torch_utils import (aggr_edges_over_sequences, cat_var_size_tensors,
-                         floyd_warshall, get_batch_tensor_from_routes,
-                         get_indices_from_mask, get_update_at_mask, 
-                         get_variable_slice_mask, reconstruct_all_paths
-)
+import torch_utils as tu
 from trunc_normal import TruncatedNormal
 
 from simulation.citygraph_dataset import \
     DEMAND_KEY, STOP_KEY, STREET_KEY, ROUTE_KEY, CityGraphData
+from simulation.transit_time_estimator import RouteGenBatchState
 
 Q_FUNC_MODE = "q function"
 PLCY_MODE = "policy"
@@ -42,10 +40,12 @@ GFLOW_MODE = "gflownet"
 # FEAT_NORM_MOMENTUM = 0.001
 FEAT_NORM_MOMENTUM = 0.0
 
-# use this in place of -float('inf') to avoid nans in some badly-behaved
+# minimum and maximum log probs to use when "forcing" an action selection
+ # use this in place of -float('inf') to avoid nans in some badly-behaved
  # backprops
-TORCH_FMIN = torch.finfo(torch.float).min
-TORCH_FMAX = torch.finfo(torch.float).max
+TORCH_FMAX = 10**10
+TORCH_FMIN = -TORCH_FMAX
+
 
 GREEDY = False
 
@@ -192,7 +192,7 @@ class RoutesEncoder(nn.Module):
         nodepair_descs: batch_size x n_nodepairs x embed_dim tensor
         """
         route_feats, pad_mask = \
-            aggr_edges_over_sequences(routes_tensor, nodepair_descs, 'concat')
+            tu.aggr_edges_over_sequences(routes_tensor, nodepair_descs, 'concat')
         
         # flatten multiple batch dimensions
         n_batch_dims = routes_tensor.ndim - 1
@@ -296,7 +296,8 @@ class SumRouteEncoder(RoutesEncoder):
         """
         nodepair_descs: batch_size x n_nodepairs x embed_dim tensor
         """
-        route_feats = aggr_edges_over_sequences(routes_tensor, nodepair_descs, 'sum')
+        route_feats = \
+            tu.aggr_edges_over_sequences(routes_tensor, nodepair_descs, 'sum')
 
         return route_feats
 
@@ -348,9 +349,9 @@ class TransformerRouteEncoder(RoutesEncoder):
         seq_lens = (~padding_mask).sum(dim=1)
         max_seq_len = seq_lens.max()
         end_token = self.end_token.expand(route_seqs.shape[0], -1)
-        if max_seq_len > route_seqs.shape[1]:
+        if max_seq_len + 1 > route_seqs.shape[1]:
             # pad the end of route seqs and padding mask
-            placeholder = torch.zeros_like(end_token)
+            placeholder = torch.zeros_like(end_token)[:, None]
             route_seqs = torch.cat((route_seqs, placeholder), dim=1)
             padding_mask = torch.cat((padding_mask, 
                                       torch.ones((route_seqs.shape[0], 1),
@@ -600,6 +601,7 @@ class FeatureNorm(nn.Module):
             return xx
         
         if not self.initialized or not self.frozen:
+            # just use x's own mean and variance
             old_shape = xx.shape
             xx = xx.reshape(-1, xx.shape[-1])
             x_mean = xx.mean(0).detach()
@@ -609,6 +611,7 @@ class FeatureNorm(nn.Module):
 
         if not self.frozen:
             if self.new_mean is None:
+                # initialize the new-samples mean
                 self.new_mean = x_mean
                 self.new_var = x_var
                 self.new_count = x_size
@@ -730,7 +733,7 @@ class RouteScorer(nn.Module):
                  mlp_width=None):
         super().__init__()
         self.embed_dim = embed_dim
-        self.n_extra_feats = 12
+        self.n_extra_feats = 13
         self.dropout = dropout
         if mlp_width is None:
             mlp_width = self.in_dim * 2
@@ -966,7 +969,7 @@ class RouteGeneratorBase(nn.Module):
 
     def step(self, state, greedy):
         log.debug("stepping")
-        # # apply normalization to input features
+        # apply normalization to input features
         norm_stops_x = state.norm_node_features
         # assemble route data objects
         input_data_list = state.graph_data.to_data_list()
@@ -1001,7 +1004,7 @@ class RouteGeneratorBase(nn.Module):
         state.add_new_routes(
             batch_new_routes, self.only_routes_with_demand_are_valid)
         return state, logits, entropy
-
+    
     def _get_edge_features(self, state):
         # edge feats: demand, drive time, has route, route time, has street,
          # street time, has 1-transfer path, has 2-transfer path, has any path,
@@ -1011,15 +1014,15 @@ class RouteGeneratorBase(nn.Module):
         has_direct_route = state.route_mat.isfinite()
         edge_feature_parts.append(has_direct_route)
         # time on direct route 
-        finite_direct_times = get_update_at_mask(state.route_mat, 
-                                                 ~has_direct_route)
+        finite_direct_times = tu.get_update_at_mask(state.route_mat, 
+                                                    ~has_direct_route)
         edge_feature_parts.append(finite_direct_times)
         # has street
         has_street = state.graph_data.street_adj.isfinite()
         edge_feature_parts.append(has_street)
         # street time
-        street_times = get_update_at_mask(state.graph_data.street_adj,
-                                          ~has_street)
+        street_times = tu.get_update_at_mask(state.graph_data.street_adj,
+                                             ~has_street)
         edge_feature_parts.append(street_times)
         # has 1-transfer path, 2-transfer path, any path, shortest transit
         # compute route shortest path lengths
@@ -1056,10 +1059,69 @@ class RouteGeneratorBase(nn.Module):
 
         return edge_features
 
-    def forward(self, state, greedy=False):
-        return self._forward_helper(state, greedy)
+    # def _get_edge_features(self, state):
+    #     # edge feats: demand, drive time, has route, route time, has street,
+    #      # street time, has 1-transfer path, has 2-transfer path, has any path,
+    #      # shortest transit path time, is same node
+    #     # has a direct route
+    #     bool_feats = []
+    #     has_direct_route = state.route_mat.isfinite()
+    #     bool_feats.append(has_direct_route)
+    #     # has street
+    #     has_street = state.street_adj.isfinite()
+    #     bool_feats.append(has_street)
+    #     bool_feats.append(state.has_path)
 
-    def _forward_helper(self, state, greedy=False):
+    #     # has 1-transfer path, 2-transfer path, any path, shortest transit
+    #     is_direct_path = state.directly_connected
+    #     flt_is_direct_path = is_direct_path.to(torch.float32)
+    #     flt_upto_1trnsfr_path = flt_is_direct_path.bmm(flt_is_direct_path)
+    #     flt_upto_2trnsfr_path = flt_upto_1trnsfr_path.bmm(flt_is_direct_path)
+    #     upto_1trnsfr_path = flt_upto_1trnsfr_path.bool()
+    #     is_1trnsfr_path = upto_1trnsfr_path ^ is_direct_path
+    #     bool_feats.append(is_1trnsfr_path)
+    #     upto_2trnsfr_path = flt_upto_2trnsfr_path.bool()
+    #     is_2trnsfr_path = upto_2trnsfr_path ^ upto_1trnsfr_path
+    #     bool_feats.append(is_2trnsfr_path)
+
+    #     # is same node
+    #     eye = torch.eye(state.max_n_nodes, device=state.device)
+    #     eye = eye.expand(state.batch_size, -1, -1)
+    #     bool_feats.append(eye)
+    #     bool_feats = torch.stack(bool_feats, dim=-1).to(dtype=torch.float32)
+
+    #     # time on direct route 
+    #     numerical_parts = [state.demand]
+    #     finite_direct_times = get_update_at_mask(state.route_mat, 
+    #                                              ~has_direct_route)
+    #     numerical_parts.append(finite_direct_times)
+
+    #     # street time
+    #     street_times = get_update_at_mask(state.street_adj, ~has_street)
+    #     numerical_parts.append(street_times)
+
+    #     # times of existing paths
+    #     transit_times = state.transit_times.clone()
+    #     transit_times[~state.has_path] = 0
+    #     numerical_parts.append(transit_times)
+    #     numerical_feats = torch.stack(numerical_parts, dim=-1)
+    #     numerical_feats = self.edge_norm(numerical_feats)
+
+    #     # add planes with cost weights
+    #     # we know they range roughly uniformly from 0 to 1, so don't bother 
+    #      # scaling
+    #     cost_weight_planes = state.cost_weights_tensor[:, None, None, :]
+    #     cost_weight_planes = cost_weight_planes.expand(-1, state.max_n_nodes, 
+    #                                                     state.max_n_nodes, -1)
+    #     edge_features = torch.cat(
+    #         (bool_feats, numerical_feats, cost_weight_planes), dim=-1)
+
+    #     drive_times = self.time_norm(state.drive_times[..., None])
+    #     edge_features = torch.cat((edge_features, drive_times), dim=-1)
+
+    #     return edge_features
+
+    def forward(self, state, greedy=False):
         # do a full rollout
         state = self.setup_planning(state)
 
@@ -1070,14 +1132,9 @@ class RouteGeneratorBase(nn.Module):
             state, logits, entropy = self.step(state, greedy)
             all_logits.append(logits)
             all_entropy += entropy
-            
-        if self.fixed_freq is not None:
-            freqs = [[self.fixed_freq for _ in range(len(rs))]
-                     for rs in state.routes]
-        else:
-            freqs = None
-
-        routes_tensor = get_batch_tensor_from_routes(state.routes, state.device)
+    
+        routes_tensor = \
+            tu.get_batch_tensor_from_routes(state.routes, state.device)
         # TODO make this return a named tuple with names that actually make 
          # sense
         logits = torch.cat(all_logits, dim=1)
@@ -1098,7 +1155,7 @@ class RouteGeneratorBase(nn.Module):
                                          device=node_descs.device)
         node_pad_mask = torch.zeros((state.batch_size, state.max_n_nodes), 
                                     dtype=bool, device=node_descs.device)
-        for bi, num_nodes in enumerate(state.nodes_per_scenario):
+        for bi, num_nodes in enumerate(state.n_nodes):
             folded_node_descs[bi, :num_nodes, :node_descs.shape[-1]] = \
                 node_descs[:num_nodes]
             node_pad_mask[bi, num_nodes:] = True
@@ -1135,9 +1192,33 @@ class RouteGeneratorBase(nn.Module):
 class PathCombiningRouteGenerator(RouteGeneratorBase):
     def __init__(self, *args, n_pathscorer_layers=3, pathscorer_hidden_dim=16,
                  halt_scorer_type='endpoints', n_halt_layers=3, n_halt_heads=4,
-                 force_linking_unlinked=False, logit_clip=None, **kwargs):
+                 force_linking_unlinked=False, logit_clip=None, 
+                 serial_halting=True, max_act_len=None, **kwargs):
+        """Generates routes by combining shortest paths.
+
+        n_pathscorer_layers -- number of layers in the MLP that updates path
+            scores
+        pathscorer_hidden_dim -- number of hidden units in the MLP that updates
+            path scores
+	halt_scorer_type -- the type of halt scorer module to use.
+        n_halt_layers -- number of layers in the network that computes the 
+            halting score.
+        n_halt_heads -- number of heads in the network that computes the
+            halting score, if it has heads.
+        force_linking_unlinked -- if True, then the model is forced to extend
+            routes in ways that link unlinked node pairs.
+        logit_clip -- if not None, then the logits of path extensions are 
+            clipped to this value.
+        serial_halting -- if True, the halt score is used to make a binary
+            halt-or-continue choice before choosing each extension.  If False,
+            the 'halt' action is part of the same set of actions as the 
+            extensions.
+        """
         super().__init__(*args, **kwargs)
         self.logit_clip = logit_clip
+        self.serial_halting = serial_halting
+        # only paths shorter than this can be added to a route
+        self.max_act_len = max_act_len
         self.nodepair_scorer = get_mlp(self.n_nodepair_layers, 
                                        self.embed_dim,
                                        self.nonlin_type, self.dropout, 
@@ -1147,7 +1228,7 @@ class PathCombiningRouteGenerator(RouteGeneratorBase):
         assert self.only_routes_with_demand_are_valid is False, 'not supported'
         self.force_linking_unlinked = force_linking_unlinked
 
-        path_scorer_indim = 15
+        path_scorer_indim = 16
         # self.path_input_norm = FeatureNorm(FEAT_NORM_MOMENTUM, 
         #                                    path_scorer_indim - 1)
         self.path_scorer = nn.Sequential(
@@ -1182,387 +1263,321 @@ class PathCombiningRouteGenerator(RouteGeneratorBase):
         # self.value_net = ValueNetScorer(self.embed_dim, self.nonlin_type, 
         #                                 self.dropout, n_halt_layers)
 
-    def _get_routes(self, n_routes, state, node_descs, extra_nodepair_feats, 
-                    greedy):
-        # fold the node features
-        batch_size = state.batch_size
-        max_n_nodes = max(state.nodes_per_scenario)
-        node_descs, node_pad_mask = self.fold_node_descs(node_descs, state)
+    def forward(self, state: RouteGenBatchState, greedy=False):
+        # do a full rollout
+        state = self.setup_planning(state)
 
+        log.debug("starting route-generation loop")
+        all_logits = []
+        all_entropy = 0
+
+        while not state.is_done().all():
+            action, logits, entropy = self.step(state, greedy)
+            # if the action is to add stops, the state must not be done
+            assert not state.is_done()[action[:, 0] > -1].any(), \
+                "non-null action when state is done!"
+            state.shortest_path_action(action)
+
+            all_logits.append(logits)
+            all_entropy += entropy
+
+        routes_tensor = tu.get_batch_tensor_from_routes(state.routes, 
+                                                        state.device)
+        
+        logits = torch.stack(all_logits, dim=1)
+        result = PlanResults(
+            state=state, stop_logits=None,
+            route_logits=logits, freq_logits=None, entropy=entropy, 
+            stops_tensor=None, routes_tensor=routes_tensor, freqs_tensor=None, 
+            stop_est_vals=None, route_est_vals=None, freq_est_vals=None
+        )
+        return result
+    
+    def plan_new_route(self, state: RouteGenBatchState, greedy=False, 
+                       actions=None):
+        # generate the input batch
+        encoding = self._encode_graph(state)
+        init_n_routes = state.n_finished_routes
+
+        # while not all routes are done,
+        ext_actions_given = actions is not None
+        if not ext_actions_given:
+            actions = []
+        ended = torch.zeros((state.batch_size,), dtype=torch.bool,
+                            device=state.device)
+        all_logits = 0
+        all_entropy = 0.0
+        while not ended.all():
+            # call step, passing in the input batch
+            if ext_actions_given:
+                # take the next action from the sequence
+                action = actions[:, 0]
+                actions = actions[:, 1:]
+            else:
+                action = None
+            action, logits, entropy = self.step(state, greedy, action, 
+                                                encoding)
+
+            # sum the logits and entropy where a real action was taken
+            all_logits += logits * (~ended)
+            all_entropy += entropy * (~ended)
+            # update endedness
+            just_ended = action[:, 0] == -1
+            ended = ended | just_ended
+            # set the action to -1 if the route is already done
+            action[ended] = -1
+
+            # apply the action to the state
+            state.shortest_path_action(action)
+
+            if not ext_actions_given:
+                # append the action to the collection
+                actions.append(action)
+
+        # return the updated state, the logit, and the actions
+        if not ext_actions_given:
+            actions = torch.stack(actions, dim=1)
+
+        return actions, all_logits, all_entropy
+
+    def step(self, state: RouteGenBatchState, greedy=False, actions=None,
+             precalc_data=None):
+        """Take an action for the given state.
+        actions -- a batch_size x 2 tensor of predetermined actions to take. If
+            None, the actions will be chosen by the model.  If the value is 
+            (-1, -1), that means to halt.  Otherwise, the first and second 
+            columns give the starting and ending nodes of the path segment to
+            add.
+        """
+        log.debug("stepping")
+
+        if precalc_data is None:
+            node_descs, node_pad_mask, np_embeds, path_scores = \
+                self._encode_graph(state)
+        else:
+            node_descs, node_pad_mask, np_embeds, path_scores = precalc_data
+        
+        path_seqs = state.get_shortest_path_sequences()
+        batch_size = state.batch_size
+            
+        # don't choose segments greater than the max route length
+        path_lens = (path_seqs > -1).sum(dim=-1)
+        current_route_lens = state.current_route_n_stops
+        post_ext_lens = current_route_lens[:, None, None] + path_lens
+        exts_are_too_long = post_ext_lens > state.max_route_len[:, None, None]
+        paths_are_invalid = exts_are_too_long | ~state.valid_terms_mat
+
+        # experimentally, only allow adding one node at a time
+        if self.max_act_len is not None:
+            path_too_long = path_lens > self.max_act_len
+            paths_are_invalid = paths_are_invalid | path_too_long
+        
+        if self.force_linking_unlinked:
+            # don't choose segments that don't extend coverage, if coverage is
+             # not complete
+            extends_coverage_if_needed = check_extensions_add_connections(
+                state.has_path, path_seqs)
+            paths_are_invalid |= ~extends_coverage_if_needed
+
+        # set all invalid path scores to FMIN
+        path_scores = self.set_invalid_scores_to_fmin(path_scores,
+                                                      ~paths_are_invalid)
+        no_valid_options = paths_are_invalid.all(-1).all(-1)
+        old_route_is_done = state.is_done() | no_valid_options
+        
+        # determine if we're extending a route or starting a new one
+        # for starting, we ignore the halt choice
+        starting = ~state.is_done() & (current_route_lens == 0)
+
+        # update scores and get validity for extensions to non-empty routes
+        padding = (0,1, 0,1, 0,0)
+        drive_times = torch.nn.functional.pad(state.drive_times, padding)
+        padding = (0, 0) + padding
+        np_embeds = torch.nn.functional.pad(np_embeds, padding)
+        are_on_routes = torch.zeros((batch_size, state.max_n_nodes + 1), 
+                                    device=state.device).bool()
+        batch_idxs = state.batch_indices        
+        are_on_routes[batch_idxs[:, None], state.current_routes] = True
+        # make padding column False
+        are_on_routes[:, -1] = False
+        getext_args = (state, current_route_lens, are_on_routes, path_seqs, 
+                       np_embeds, drive_times, path_scores, path_lens, 
+                       paths_are_invalid)
+        prev_scores, prev_valid = self._get_extension_scores(*getext_args, 
+            before_or_after='before')
+        next_scores, next_valid = self._get_extension_scores(*getext_args,
+            before_or_after='after')
+        
+        # compute the scores for halting
+        halt_scores = self.halt_scorer(state, node_descs, state.current_routes, 
+                                       state.current_route_time, node_pad_mask)
+        if self.force_linking_unlinked:
+            # don't halt if the system is not fully linked and we can
+             # continue
+            not_fully_linked = ~(state.has_path.all(-1).all(-1))
+            halt_scores[not_fully_linked] = TORCH_FMIN
+
+        # don't halt if the route is too short
+        halt_scores[current_route_lens < state.min_route_len] = TORCH_FMIN
+        # but do halt if it's done, including if there are no extensions
+        halt_scores[old_route_is_done] = TORCH_FMAX
+        ext_valid = prev_valid | next_valid
+        no_valid_ext = ~ext_valid.any(-1).any(-1)
+        halt_scores[~starting & no_valid_ext] = TORCH_FMAX
+
+        if self.serial_halting:
+            # decide whether to halt
+            continue_scores = -halt_scores
+            cont_or_halt = torch.cat((continue_scores, halt_scores), dim=-1)
+
+            given_halt_actions = None
+            if actions is not None:
+                # predetermined actions were given, so force them to be chosen
+                given_halt_actions = (actions[:, 0] == -1).to(torch.long)
+
+            halt, corh_logit, corh_ent = select(cont_or_halt, not greedy,
+                                                self.temperature,
+                                                selection=given_halt_actions)
+            assert (corh_logit > TORCH_FMIN).all(), "halt score is too low!"
+            corh_logit = corh_logit.squeeze(1)
+            chose_halt = halt.squeeze(1).bool()
+            
+            # update doneness
+            route_is_done = old_route_is_done | chose_halt
+
+        ext_scores = prev_scores * prev_valid + next_scores * next_valid + \
+            TORCH_FMIN * ~ext_valid
+        # for extending, we care whether we chose to halt
+        extending = ~starting & ~route_is_done
+        xtnding_exp = extending[:, None, None]
+        start_scores = self._update_path_scores(state, path_scores, path_lens,
+                                                state.drive_times)
+        ppe_scores = start_scores * ~xtnding_exp + ext_scores * xtnding_exp
+
+        # select an option
+        flat_path_scores = ppe_scores.reshape(batch_size, -1)
+        if not self.serial_halting:
+            flat_path_scores = torch.cat((flat_path_scores, halt_scores), 
+                                         dim=-1)
+            halt_idx = flat_path_scores.shape[-1] - 1
+
+        given_ext_actions = None
+        if actions is not None:
+            # predetermined actions were given, so force them to be chosen
+            given_ext_actions = actions[:, 0] * state.n_nodes + actions[:, 1]
+            if self.serial_halting:
+                given_ext_actions[route_is_done] = 0
+            else:
+                given_ext_actions[route_is_done] = halt_idx
+                given_ext_actions[actions[:, 0] < 0] = halt_idx
+
+        flat_idxs, ext_logit, ext_ent = select(flat_path_scores, not greedy,
+                                               self.temperature,
+                                               selection=given_ext_actions)
+
+        flat_idxs = flat_idxs.squeeze(-1)
+        ext_logit = ext_logit.squeeze(-1)
+        if self.serial_halting:
+            # these don't contribute if we chose to halt
+            ext_logit[chose_halt] = 0.0
+            ext_ent[chose_halt] = 0.0
+        else:
+            # mark the halt action as chosen
+            chose_halt = flat_idxs == halt_idx
+            route_is_done = route_is_done | chose_halt
+
+        assert ((ext_logit > TORCH_FMIN) | route_is_done).all()
+
+        from_idxs = torch.div(flat_idxs, state.n_nodes, rounding_mode='floor')
+        to_idxs = flat_idxs % state.n_nodes
+        folded_idxs = torch.stack((from_idxs, to_idxs), dim=-1)
+        set_to_minus1 = route_is_done[:, None]
+        folded_idxs = folded_idxs * ~set_to_minus1 + -1 * set_to_minus1
+
+        # combine the logits and entropies of the decisions
+        if self.serial_halting:
+            logits = corh_logit + ext_logit
+            entropy = corh_ent + ext_ent
+        else:
+            logits = ext_logit
+            entropy = ext_ent
+
+        # is_halt = (folded_idxs == -1).any(-1)
+        # badlen = (current_route_lens < state.min_route_len) & \
+        #     (current_route_lens > 0)
+        # if (is_halt & badlen).any():
+        #     log.warning("Halting a route that's too short!")
+
+        return folded_idxs, logits, entropy
+
+    def _encode_graph(self, state: RouteGenBatchState):
+        # assemble route data objects
+        input_batch = copy.copy(state.graph_data)
+        input_batch.x = state.norm_node_features
+        input_batch.edge_index = input_batch[DEMAND_KEY].edge_index
+        edge_feats_square = self._get_edge_features(state)
+        if type(self.backbone_net) in [EdgeGraphNet, GraphAttnNet]:
+            isedge_mask = torch.eye(state.max_n_nodes, device=state.device)
+            isedge_mask = ~(isedge_mask.bool())
+            if state.max_n_nodes * state.batch_size > input_batch.num_nodes:
+                # some graphs are smaller than the max size, so mask out the
+                 # invalid node locations.
+                isedge_mask = isedge_mask.repeat(state.batch_size, 1, 1)
+                for bi in range(state.batch_size):
+                    isedge_mask[bi, state.n_nodes[bi]:] = False
+                    isedge_mask[bi, :, :state.n_nodes[bi]:] = False
+            else:
+                isedge_mask = isedge_mask.expand(state.batch_size, -1, -1)
+
+            edge_feats_flat = edge_feats_square[isedge_mask]
+            input_batch.edge_attr = edge_feats_flat
+
+        path_seqs = state.get_shortest_path_sequences()
+
+        # run GNN forward
+        if self.backbone_net.gives_edge_features:
+            node_descs, _ = self.backbone_net(input_batch)
+        else:
+            node_descs = self.backbone_net(input_batch)
+
+        node_descs, node_pad_mask = self.fold_node_descs(node_descs, state)
         if self.symmetric_routes:
             # just sum them
             np_embeds = node_descs[:, None] + node_descs[:, :, None]
         else:
             # concatenate them along the last dimension
             np_embeds = get_node_pair_descs(node_descs)
-        if extra_nodepair_feats is not None:
-            np_embeds = torch.cat((np_embeds, extra_nodepair_feats), dim=-1)
+        np_embeds = torch.cat((np_embeds, edge_feats_square), dim=-1)
         np_scores = self.nodepair_scorer(np_embeds).squeeze(-1)
 
-        # val_est = self.value_net(state, node_descs, node_pad_mask)
-            
-        if not hasattr(state.graph_data, '_seqs'):
-            # compute the shortest paths and store them in the graph_data object
-             # so we don't need to recompute them for each route.
-            seqs, _ = reconstruct_all_paths(state.graph_data.nexts)
-            state.graph_data._seqs = seqs
-        else:
-            seqs = state.graph_data._seqs
+        assert (np_scores.abs() < 10**6).all(), "Nodepair scores are " \
+            "blowing up, something wierd is going on!"
 
-        path_scores = aggr_edges_over_sequences(seqs, np_scores[..., None], 
-                                                'sum')
+        path_scores = tu.aggr_edges_over_sequences(path_seqs, 
+                                                   np_scores[..., None], 'sum')
         path_scores.squeeze_(-1)
-        path_scores = \
-            self.set_invalid_scores_to_fmin(path_scores, state.valid_terms_mat)
 
-        routes = []
-        all_logits = []
-        entropy = 0
-        max_n_nodes = node_descs.shape[1]
-        batch_size = state.graph_data.num_graphs
-        batch_idxs = torch.arange(batch_size, device=np_scores.device)
-        for ii in range(n_routes):
-            route, logits, route_entropy = \
-                self._assemble_route(state, node_descs, seqs, path_scores, 
-                                     np_embeds, greedy, node_pad_mask)
-            routes.append(route)
-            all_logits.append(logits)
-            entropy += route_entropy
+        return node_descs, node_pad_mask, np_embeds, path_scores
 
-            if ii == n_routes - 1:
-                # don't do the below on the last iteration
-                break
-
-            else:
-                # update np_scores based on new routes
-                mask_shape = (batch_size, max_n_nodes+1, max_n_nodes+1)
-                new_mask = torch.zeros(mask_shape, device=np_scores.device,
-                                        dtype=bool)
-                for ii in range(route.shape[1] - 1):
-                    new_mask[batch_idxs, route[:, ii], route[:, ii+1:]] = True
-                new_mask = new_mask[:, :-1, :-1]
-                np_scores = get_update_at_mask(np_scores, new_mask)
-        
-        all_logits = cat_var_size_tensors(all_logits, dim=1)
-        routes = torch.stack(routes, dim=-2)
-
-        # prune extra route sequence padding
-        max_route_len = (routes > -1).sum(dim=-1).max()
-        routes = routes[..., :max_route_len]
-        return routes, all_logits, entropy #, val_est
-    
-    def _update_path_scores(self, state, base_path_scores, new_path_lens, 
-                            new_drive_times, prev_len=None, 
-                            prev_drive_time=None):
-        """Update the path scores based on the new path lengths and drive times.
-        """
-        is_valid = base_path_scores > TORCH_FMIN
-        # update_in = torch.stack((new_drive_times, new_path_lens), dim=-1)
-        # score_normalizer = (state.max_route_len / 5) ** 2
-        if prev_len is None:
-            prev_len = torch.zeros_like(new_path_lens)
-        else:
-            # add a dimension to match new_path_lens
-            prev_len = prev_len[:, None]
-            prev_len = prev_len.expand(-1, new_path_lens.shape[-1])
-        if prev_drive_time is None:
-            prev_drive_time = torch.zeros_like(new_drive_times)
-        else:
-            # add a dimension to match new_drive_times
-            prev_drive_time = prev_drive_time[:, None]
-            prev_drive_time = prev_drive_time.expand(-1, 
-                                                     new_drive_times.shape[-1])
-        
-        update_in = torch.stack((base_path_scores, new_drive_times,
-                                 new_path_lens, prev_drive_time, prev_len), 
-                                 dim=-1)
-
-        global_feat = state.get_global_state_features()
-        update_in = nn.functional.pad(update_in, (0, global_feat.shape[-1]))
-        for _ in range(update_in.ndim - global_feat.ndim):
-            global_feat = global_feat.unsqueeze(1)
-            # score_normalizer = score_normalizer.unsqueeze(1)
-
-        update_in[..., -global_feat.shape[-1]:] = global_feat
-        # update_in = self.path_input_norm(update_in[is_valid])
-
-
-        # # softmax experiment
-        # flat_bpt = base_path_scores.flatten(1, -1)
-        # flat_probs = flat_bpt.log_softmax(-1).exp()
-        # base_path_scores = flat_probs.reshape_as(base_path_scores)
-        
-        # update_in = torch.cat((update_in, base_path_scores[..., None]), dim=-1)
-
-        update_in = update_in[is_valid]
-
-        # valid_bpt = base_path_scores[is_valid]
-        # valid_bpt = (base_path_scores / score_normalizer)
-        # valid_bpt = valid_bpt.tanh()
-        # valid_bpt = mirror_log_unit(valid_bpt)
-
-
-        # print('mean: ', valid_bpt.mean().item(), 
-        #       'max: ', valid_bpt.max().item(),
-        #       'min: ', valid_bpt.min().item())
-
-        # update_in = torch.cat((update_in, valid_bpt[..., None]), dim=-1)
-
-        updated_path_scores_wo_infs = self.path_scorer(update_in).squeeze(-1)
-        if self.logit_clip is not None:
-            upswi = torch.tanh(updated_path_scores_wo_infs)
-            updated_path_scores_wo_infs = torch.clamp(upswi, -self.logit_clip, 
-                                                      self.logit_clip)
-        updated_path_scores = torch.full_like(base_path_scores, TORCH_FMIN)
-        updated_path_scores[is_valid] = updated_path_scores_wo_infs
-
-        return updated_path_scores
-
-    def _assemble_route(self, state, node_descs, path_seqs, path_scores, 
-                        nodepair_embeds, greedy, node_pad_mask=None):
-        log.debug("assembling route")
-        batch_size = state.drive_times.shape[0]
-        dev = state.device
-
-        # initialize the routes
-        path_lens = (path_seqs > -1).sum(dim=-1)
-        log.debug(format_stat_msg(path_lens, 'all path component lengths'))
-        updated_path_scores = self._update_path_scores(
-            state, path_scores, path_lens, state.drive_times)
-        # don't choose segments greater than the max route length
-        exts_are_too_long = path_lens > state.max_route_len[:, None, None]
-        is_linked = state.has_path.clone()
-        paths_are_invalid = exts_are_too_long
-        
-        if self.force_linking_unlinked:
-            extends_coverage_if_needed = check_extensions_add_connections(
-                is_linked, path_seqs)
-            paths_are_invalid |= ~extends_coverage_if_needed
-
-        updated_path_scores = get_update_at_mask(updated_path_scores,
-            paths_are_invalid, TORCH_FMIN)
-        flat_path_scores = updated_path_scores.reshape(batch_size, -1)
-
-        flat_idxs, start_logits, entropy = select(flat_path_scores, not greedy,
-                                                  self.temperature)
-
-        # gather new routes
-        exp_shape = (-1, -1, path_seqs.shape[-1])
-        exp_idxs = flat_idxs[..., None].expand(*exp_shape)
-        start_routes = path_seqs.flatten(1, 2).gather(1, exp_idxs)
-        start_routes.squeeze_(-2)
-        max_n_nodes = state.drive_times.shape[1]
-        routes = torch.full((batch_size, max_n_nodes), -1, device=dev)
-        routes[:, :start_routes.shape[-1]] = start_routes
-        route_lens = path_lens.flatten(1, 2).gather(1, flat_idxs).squeeze(-1)
-        log.debug(format_stat_msg(route_lens, 'first path component lengths'))
-
-        # mark chosen paths as invalid
-        batch_idxs = torch.arange(batch_size)
-
-        # pad each node axis with a row/column of zeros, so we can safely index
-         # with -1.
-        padding = (0,1, 0,1, 0,0)
-        drive_times = torch.nn.functional.pad(state.drive_times, padding)
-        padding = (0, 0) + padding
-        nodepair_embeds = torch.nn.functional.pad(nodepair_embeds, padding)
-        are_on_routes = torch.zeros((batch_size, max_n_nodes + 1), 
-                                      device=dev).bool()
-        are_on_routes[batch_idxs[:, None], routes] = True
-        # make padding column False
-        are_on_routes[:, -1] = False
-
-        times_from_start = torch.zeros((batch_size, max_n_nodes), device=dev)
-        init_tfs = drive_times[batch_idxs[:, None], routes[:, 0:1], routes]
-        times_from_start[:, :init_tfs.shape[-1]] = init_tfs
-
-        is_done = torch.zeros(batch_size, device=dev).bool()
-        logits = start_logits.squeeze(-1)
-        if self.force_linking_unlinked:
-            is_linked = update_connections_matrix(is_linked, routes, 
-                                                  self.symmetric_routes)
-        
-        while not is_done.all():
-            getext_args = (state, routes, times_from_start, route_lens, 
-                           are_on_routes, path_seqs, nodepair_embeds, 
-                           drive_times, path_scores, path_lens, is_linked)
-
-            next_path_scores = self._get_extension_scores(
-                *getext_args, before_or_after='after')
-            last_node = routes.gather(1, route_lens[:, None] - 1).squeeze(-1)
-
-            # repeat with to/from swapped
-            prev_path_scores = self._get_extension_scores(
-                *getext_args, before_or_after='before')
-            ext_scores = torch.cat(
-                (prev_path_scores, next_path_scores), dim=-1)
-            # no valid options, so force it to be done
-            no_valid_ext = (ext_scores == TORCH_FMIN).all(dim=-1)
-            is_done = is_done | no_valid_ext
-            # assert not ((route_lens < state.min_route_len) & no_valid_ext).any()
-
-            route_times = times_from_start.max(dim=-1)[0]
-            if self.symmetric_routes:
-                route_times *= 2
-
-            # compute halting scores
-            # n_valid_options = (ext_scores > TORCH_FMIN).sum(dim=-1)
-            # frac_valid_options = n_valid_options / ext_scores.shape[-1]
-            halt_scores = self.halt_scorer(state, node_descs, routes, 
-                                           route_times, node_pad_mask)
-            if self.force_linking_unlinked:
-                # don't halt if the system is not fully linked and we can
-                 # continue
-                not_fully_linked = ~(is_linked.flatten(-2, -1).all(-1))
-                halt_scores[not_fully_linked] = TORCH_FMIN
-
-            halt_scores[is_done] = TORCH_FMAX
-            # don't halt if the route is too short
-            halt_scores[route_lens < state.min_route_len] = TORCH_FMIN
-
-
-            # # instead of choosing between halt and continue, append the halt 
-            #  # scores to the next-path scores, and if it gets chosen, that 
-            #  # means halt.
-            # ext_scores = torch.cat((ext_scores, halt_scores), dim=-1)
-
-
-            continue_scores = -halt_scores
-            cont_or_halt = torch.cat((continue_scores, halt_scores), dim=-1)
-            halt, corh_logit, corh_ent = select(cont_or_halt, not greedy,
-                                                self.temperature)
-            entropy += corh_ent
-            corh_logit = corh_logit.squeeze(1) * ~is_done
-            # update doneness
-            halt = halt.squeeze(1).bool()
-            is_done = is_done | halt
-
-
-            # halt_idx = ext_scores.shape[-1] - 1
-            chosen_ext, ext_logits, ext_ent = select(ext_scores, not greedy,
-                                                     self.temperature)
-            # record entropy
-            entropy += ext_ent
-            # flatten the choice dimension
-            chosen_ext = chosen_ext.squeeze(-1)
-            ext_logits = ext_logits.squeeze(-1)
-
-            # # update doneness
-            # is_done = is_done | (chosen_ext == halt_idx)
-
-            # set logits and choices to 0 for already-done routes
-            ext_logits = ext_logits * ~is_done
-            chosen_ext = chosen_ext * ~is_done
-
-            # add the chosen part to the route
-            n_prevs = prev_path_scores.shape[-1]
-            chose_prev = (chosen_ext < n_prevs) & ~is_done
-            chose_next = ~(chose_prev | is_done)
-            done_idxs = is_done * -1
-            best_starts = chose_prev * (chosen_ext) + \
-                          chose_next * last_node + done_idxs
-            first_node = routes[:, 0].clone()
-            best_ends = chose_prev * first_node + \
-                        chose_next * (chosen_ext - n_prevs) + done_idxs
-
-            # -1 to account for the terminal at the joining end
-            new_part_lens = path_lens[batch_idxs, best_starts, best_ends] - 1
-
-            new_parts = torch.full_like(routes, -1)
-            np = path_seqs[batch_idxs, best_starts, best_ends].clone()
-            new_parts[:, :path_seqs.shape[-1]] = np
-
-            # trim the first nodes of new parts that are next choices
-            new_parts[chose_next, :-1] = new_parts[chose_next, 1:]
-            new_parts[chose_next, -1] = -1
-            # trim the last nodes of new parts that are previous choices
-            max_idx = new_parts.shape[-1] - 1
-            last_node_locs = new_part_lens * chose_prev + max_idx * ~chose_prev
-            new_parts.scatter_(1, last_node_locs[:, None], -1)
-            
-            # first part is current route if we chose to add next OR halt
-            first_part_lens = new_part_lens * chose_prev + \
-                              route_lens * ~chose_prev
-            first_parts = routes * ~chose_prev[:, None] + \
-                          new_parts * chose_prev[:, None]
-            first_part_mask = get_variable_slice_mask(
-                routes, dim=1, tos=first_part_lens)
-
-            # second part is zeros if we chose to halt
-            scnd_part_lens = route_lens * chose_prev + \
-                             new_part_lens * chose_next
-            scnd_parts = new_parts * chose_next[:, None] + \
-                         routes * chose_prev[:, None]
-
-            # set the new first part of the route
-            routes = get_update_at_mask(routes, first_part_mask, first_parts)
-
-            # part_lens = first_part_lens * chose_prev + scnd_part_lens * chose_next
-            # part_lens = part_lens[part_lens > 0]
-            # if part_lens.numel() > 0:
-            #     log.debug(format_stat_msg(part_lens, 'new part lengths'))
-
-            # set the new second part of the route
-            new_route_lens = first_part_lens + scnd_part_lens
-            scnd_part_mask = get_variable_slice_mask(
-                routes, dim=1, froms=first_part_lens, tos=new_route_lens)
-            scnd_part_len_mask = get_variable_slice_mask(
-                routes, dim=1, tos=scnd_part_lens)
-            routes[scnd_part_mask] = scnd_parts[scnd_part_len_mask]
-
-            # update times_from_start
-            # first, times_from_start for the new route's first part
-            new_part_tfs = drive_times[batch_idxs[:, None], 
-                                        best_starts[:, None], new_parts]
-            first_part_tfs = times_from_start * ~chose_prev[:, None] + \
-                             new_part_tfs * chose_prev[:, None]
-            times_from_start[first_part_mask] = first_part_tfs[first_part_mask]
-
-            # then, times_from_start for the new route's second part
-            np_end_idxs = (new_part_lens - 1) * (new_part_lens > 0)
-            np_end_tfs = new_part_tfs.gather(1, np_end_idxs[:, None])
-            next_old_tfs = times_from_start + np_end_tfs                
-            cur_end_tfs = times_from_start.gather(1, route_lens[:, None] - 1)
-            next_new_part_tfs = new_part_tfs + cur_end_tfs
-            scnd_part_tfs = next_new_part_tfs * chose_next[:, None] + \
-                            next_old_tfs * chose_prev[:, None]
-            times_from_start[scnd_part_mask] = scnd_part_tfs[scnd_part_len_mask]
-
-            # update route and tracking variables
-            are_on_routes[batch_idxs[:, None], routes] = True
-            # keep padding column False
-            are_on_routes[:, -1] = False
-            # update route lengths
-            route_lens = new_route_lens
-
-            if self.force_linking_unlinked:
-                is_linked = update_connections_matrix(is_linked, routes,
-                                                      self.symmetric_routes)
-
-            logits += ext_logits + corh_logit
-
-        # combine all logits
-        logits = logits[:, None]
-        entropy = entropy[:, None]
-
-        log.debug("new route assembled!")
-        return routes, logits, entropy
-
-    def _get_extension_scores(self, state, routes, times_from_start, route_lens, 
+    def _get_extension_scores(self, state: RouteGenBatchState, route_lens, 
                               are_on_routes, all_paths, nodepair_embeds, 
-                              drive_times, path_scores, path_lens, is_linked,
-                              before_or_after='after'):
+                              drive_times, path_scores, path_lens, 
+                              invalid_terms, before_or_after='after'):
         log.debug("get extension scores")
         assert before_or_after in ['before', 'after']
         lens_wo_term = route_lens - 1
+        # clamp for cases where the route is empty, so we don't get -1
+        lens_wo_term.clamp_(min=0)
+        times_from_start = state.current_route_times_from_start
+        routes = state.current_routes
         final_times = times_from_start.gather(1, lens_wo_term[:, None])
         times_to_end = (times_from_start - final_times).abs()
         if before_or_after == 'after':
             # terminal is last node
-            mask = get_variable_slice_mask(routes, 1, froms=lens_wo_term)
-            routes_but_terminal = get_update_at_mask(routes, mask, -1)[:, :-1]
+            mask = tu.get_variable_slice_mask(routes, 1, froms=lens_wo_term)
+            routes_but_terminal = tu.get_update_at_mask(routes, mask, -1)[:, :-1]
             terminal_nodes = routes.gather(1, lens_wo_term[:, None]).squeeze(-1)
-            times_to_end = get_update_at_mask(times_to_end, mask, 0)[:, :-1]
+            times_to_end = tu.get_update_at_mask(times_to_end, mask, 0)[:, :-1]
         else:
             # terminal is first node
             routes_but_terminal = routes[:, 1:].clone()
@@ -1578,7 +1593,7 @@ class PathCombiningRouteGenerator(RouteGeneratorBase):
             all_paths = all_paths.transpose(-3, -2)
 
         # get possible extensions
-        batch_idxs = torch.arange(routes.shape[0], device=routes.device)
+        batch_idxs = state.batch_indices
         raw_extension_paths = all_paths[batch_idxs, terminal_nodes]
         extension_paths = raw_extension_paths.clone()
         # ignore the terminal itself in the extensions
@@ -1631,27 +1646,108 @@ class PathCombiningRouteGenerator(RouteGeneratorBase):
                                               added_drive_times, route_lens,
                                               times_to_end.max(-1)[0])
 
-        revisits = are_on_routes[batch_idxs[:, None, None], extension_paths]
+        assert ext_scores.isfinite().all()
+
+        revisits = are_on_routes[batch_idxs[:, None, None], extension_paths]            
         revisits = revisits.any(dim=-1)
         is_empty_path = path_lens[batch_idxs, terminal_nodes] == 0
-
         invalid = revisits | is_empty_path | \
             (new_lens > state.max_route_len[:, None])
 
-        # for batch elements that are not fully-connected, set scores of paths
-         # that don't make a new connection to TORCH_FMIN
         if self.force_linking_unlinked:
             extends_coverage_if_needed = check_extensions_add_connections(
-                is_linked, raw_extension_paths)
+                state.has_path, raw_extension_paths)
             invalid |= ~extends_coverage_if_needed
-                
-        ext_scores = get_update_at_mask(ext_scores, invalid, TORCH_FMIN)
-        assert not ext_scores.isnan().any()
+
+        out_scores = torch.zeros_like(path_scores)
+        out_scores[batch_idxs, terminal_nodes] = ext_scores
+        out_valids = torch.zeros_like(path_scores, dtype=bool)
+        out_valids[batch_idxs, terminal_nodes] = ~invalid
+
+        if before_or_after == 'before':
+            # swap from- and to-node axes back
+            out_scores = out_scores.transpose(-2, -1)
+            out_valids = out_valids.transpose(-2, -1)
+
+        out_valids &= ~invalid_terms
+        out_scores = tu.get_update_at_mask(out_scores, ~out_valids, TORCH_FMIN)
 
         log.debug("extension scores gotten")
 
-        return ext_scores
+        return out_scores, out_valids
+
+    # def _update_path_scores(self, state, base_path_scores, new_path_lens, 
+    #                         new_drive_times):
+    #     """Update the path scores based on the new path lengths and drive times.
+    #     """
+    #     if (base_path_scores > 10**5).any():
+    #         log.warning("base path scores are blowing up!")
+
+    #     is_valid = base_path_scores > TORCH_FMIN
+    #     update_in = torch.stack((base_path_scores, new_drive_times,
+    #                              new_path_lens), dim=-1)
+
+    #     global_feat = state.get_global_state_features()
+    #     update_in = nn.functional.pad(update_in, (0, global_feat.shape[-1]))
+    #     for _ in range(update_in.ndim - global_feat.ndim):
+    #         global_feat = global_feat.unsqueeze(1)
+    #     update_in[..., -global_feat.shape[-1]:] = global_feat
+    #     update_in = update_in[is_valid]
+
+    #     updated_path_scores_wo_infs = self.path_scorer(update_in).squeeze(-1)
+    #     if self.logit_clip is not None:
+    #         upswi = torch.tanh(updated_path_scores_wo_infs)
+    #         updated_path_scores_wo_infs = torch.clamp(upswi, -self.logit_clip, 
+    #                                                   self.logit_clip)
+    #     updated_path_scores = torch.full_like(base_path_scores, TORCH_FMIN)
+    #     updated_path_scores[is_valid] = updated_path_scores_wo_infs
+
+    #     return updated_path_scores
     
+    def _update_path_scores(self, state: RouteGenBatchState, base_path_scores, 
+                            new_path_lens, new_drive_times, prev_len=None, 
+                            prev_drive_time=None):
+        """Update the path scores based on the new path lengths and drive times.
+        """
+        is_valid = base_path_scores > TORCH_FMIN
+        if prev_len is None:
+            prev_len = torch.zeros_like(new_path_lens)
+        else:
+            # add a dimension to match new_path_lens
+            prev_len = prev_len[:, None]
+            prev_len = prev_len.expand(-1, new_path_lens.shape[-1])
+        if prev_drive_time is None:
+            prev_drive_time = torch.zeros_like(new_drive_times)
+        else:
+            # add a dimension to match new_drive_times
+            prev_drive_time = prev_drive_time[:, None]
+            prev_drive_time = prev_drive_time.expand(-1, 
+                                                     new_drive_times.shape[-1])
+        
+        update_in = torch.stack((base_path_scores, new_drive_times,
+                                 new_path_lens, prev_drive_time, prev_len), 
+                                 dim=-1)
+
+        global_feat = state.get_global_state_features()
+        update_in = nn.functional.pad(update_in, (0, global_feat.shape[-1]))
+        for _ in range(update_in.ndim - global_feat.ndim):
+            global_feat = global_feat.unsqueeze(1)
+
+        update_in[..., -global_feat.shape[-1]:] = global_feat
+
+        update_in = update_in[is_valid]
+
+        updated_path_scores_wo_infs = self.path_scorer(update_in).squeeze(-1)
+        if self.logit_clip is not None:
+            upswi = torch.tanh(updated_path_scores_wo_infs)
+            updated_path_scores_wo_infs = torch.clamp(upswi, -self.logit_clip, 
+                                                      self.logit_clip)
+        updated_path_scores = torch.full_like(base_path_scores, TORCH_FMIN)
+        updated_path_scores[is_valid] = updated_path_scores_wo_infs
+
+        return updated_path_scores
+    
+
 
 class RandomPathCombiningRouteGenerator(PathCombiningRouteGenerator):
     """Behaves like PathCombiningRouteGenerator, but all options are equally
@@ -1740,7 +1836,7 @@ class UnbiasedPathCombiner(RouteGeneratorBase):
         if not hasattr(state.graph_data, '_seqs'):
             # compute the shortest paths and store them in the graph_data object
              # so we don't need to recompute them for each route.
-            seqs, _ = reconstruct_all_paths(state.graph_data.nexts)
+            seqs, _ = tu.reconstruct_all_paths(state.graph_data.nexts)
             state.graph_data._seqs = seqs
         else:
             seqs = state.graph_data._seqs        
@@ -1774,7 +1870,7 @@ class UnbiasedPathCombiner(RouteGeneratorBase):
         candidates = seqs.flatten(1, 2)
         cdt_times = state.drive_times.flatten(1, 2)
         first_iter = True
-        batch_idxs = torch.arange(state.batch_size, device=dev)
+        batch_idxs = state.batch_indices
         relevant_attn_embeds = path_attn_embeds.flatten(1, 2)
         node_on_route = torch.zeros((state.batch_size, state.max_n_nodes + 1), 
                                     device=dev).bool()
@@ -1789,7 +1885,7 @@ class UnbiasedPathCombiner(RouteGeneratorBase):
             # zero out scores for paths that are too long
             cdt_lens = (candidates != -1).sum(dim=-1) + route_len[:, None]
             cdt_too_long = cdt_lens > state.max_route_len[:, None]
-            ext_probs = get_update_at_mask(ext_probs, cdt_too_long)
+            ext_probs = tu.get_update_at_mask(ext_probs, cdt_too_long)
             no_valid_ext = (ext_probs.sum(dim=-1) == 0)
             is_done |= no_valid_ext
             
@@ -1827,14 +1923,13 @@ class UnbiasedPathCombiner(RouteGeneratorBase):
             # enforce no extension if is_done
             chosen_ext_lens[is_done] = 0
             # compute mask for new stops on the routes
-            insert_mask = get_variable_slice_mask(
-                route, dim=1, froms=route_len, 
-                tos=route_len + chosen_ext_lens)
+            insert_mask = tu.get_variable_slice_mask(
+                route, dim=1, froms=route_len, tos=route_len + chosen_ext_lens)
             # select the chosen extensions
             exp_sel = selection[..., None].expand(-1, -1, candidates.shape[-1])
             chosen_seqs = candidates.gather(1, exp_sel).squeeze(1)
             # insert the chosen extensions
-            select_mask = get_variable_slice_mask(
+            select_mask = tu.get_variable_slice_mask(
                 chosen_seqs, dim=1, tos=chosen_ext_lens)
             # route[insert_mask] = chosen_seqs[select_mask]
             chosen_seqs_inplace = torch.zeros_like(route)
@@ -1960,7 +2055,7 @@ class NodeWalker(RouteGeneratorBase):
 
         # set up loop-tracking variables and other needed values
         is_done = torch.zeros(state.batch_size, device=state.device).bool()
-        batch_idxs = torch.arange(state.batch_size, device=state.device)
+        batch_idxs = state.batch_indices
         node_on_route = torch.zeros((state.batch_size, state.max_n_nodes + 1), 
                                     device=state.device).bool()
         adj_mat = state.graph_data.street_adj
@@ -1973,7 +2068,7 @@ class NodeWalker(RouteGeneratorBase):
             # assemble query vector: adjacent nodes and the halt option
             is_valid = is_adj[batch_idxs, cur_node] & ~node_on_route[..., :-1]
             is_valid = is_valid & ~is_done[:, None]
-            valid_idxs = get_indices_from_mask(is_valid, dim=-1)
+            valid_idxs = tu.get_indices_from_mask(is_valid, dim=-1)
             cdt_feats = node_descs[batch_idxs[:, None], valid_idxs]
             if route.shape[-1] > 1:
                 # don't enable halt option unless we have at least two stops
@@ -1988,7 +2083,7 @@ class NodeWalker(RouteGeneratorBase):
                 key_padding_mask=route_pad_mask, need_weights=False)
             cdt_descs = torch.cat((cdt_descs, cdt_feats), dim=-1)
             scores = self.next_node_scorer(cdt_descs).squeeze(-1)
-            scores = get_update_at_mask(scores, valid_idxs == -1, TORCH_FMIN)
+            scores = tu.get_update_at_mask(scores, valid_idxs == -1, TORCH_FMIN)
             cur_node, next_logit = select(scores, not greedy)
             cur_node = cur_node.squeeze(-1)
 
@@ -1996,7 +2091,7 @@ class NodeWalker(RouteGeneratorBase):
             if route.shape[-1] > 1:
                 chose_halt = cur_node == cdt_feats.shape[-2] - 1
                 is_done = is_done | chose_halt
-                cur_node = get_update_at_mask(cur_node, chose_halt, -1)
+                cur_node = tu.get_update_at_mask(cur_node, chose_halt, -1)
                 next_logit[chose_halt] = 0.0
                 
             route = torch.cat((route, cur_node[:, None]), dim=1)
@@ -2157,7 +2252,7 @@ class GraphNetBase(nn.Module):
     def __init__(self, n_layers, embed_dim, in_node_dim=None, in_edge_dim=None, 
                  out_dim=None, nonlin_type=DEFAULT_NONLIN, 
                  dropout=ATTN_DEFAULT_DROPOUT, recurrent=False, residual=False,
-                 dense=False, n_proj_layers=1, use_norm=True, layer_kwargs={}):
+                 dense=False, n_proj_layers=1, use_norm=False, layer_kwargs={}):
         """nonlin type: nonlinearity, or the string name the non-linearity to 
             use."""
         super().__init__()
@@ -2442,7 +2537,7 @@ def get_node_pair_descs(node_descs):
 def check_extensions_add_connections(is_linked, extensions):
     # determine if any path on its own makes new connections
     path_makes_new_connection = \
-        aggr_edges_over_sequences(extensions, (~is_linked[..., None]))
+        tu.aggr_edges_over_sequences(extensions, (~is_linked[..., None]))
     path_makes_new_connection = path_makes_new_connection.bool().squeeze(-1)
 
     # if a graph is not fully connected, then any path that doesn't make a 
@@ -2575,7 +2670,7 @@ def select(scores, scores_as_logits=False, softmax_temp=1,
     logits = logsoftmax(scores, softmax_temp).to(dtype=torch.float64)
 
     # do this to avoid nans from 0 * -inf
-    ent_logits = get_update_at_mask(logits, logits.isinf(), 0)
+    ent_logits = tu.get_update_at_mask(logits, logits.isinf(), 0)
     entropy = -(ent_logits.exp() * ent_logits).sum(dim=-1)
     assert not entropy.isnan().any()
 

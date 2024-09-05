@@ -24,8 +24,7 @@ from omegaconf import DictConfig
 import hydra
 
 from models import check_extensions_add_connections
-from torch_utils import reconstruct_all_paths, get_update_at_mask, \
-    get_unselected_routes, dump_routes
+import torch_utils as tu
 from simulation.citygraph_dataset import get_dataset_from_config
 from simulation.transit_time_estimator import RouteGenBatchState
 import learning.utils as lrnu
@@ -68,7 +67,7 @@ def bee_colony(state, cost_obj, init_network, n_bees=10, passes_per_it=5,
 
     if n_type3_bees > 0:
         # instantiate a random path-combining model
-        rpc_model = get_random_path_combiner()
+        rpc_model = lrnu.get_random_path_combiner()
     else:
         rpc_model = None
 
@@ -79,7 +78,7 @@ def bee_colony(state, cost_obj, init_network, n_bees=10, passes_per_it=5,
     max_n_nodes = state.max_n_nodes
 
     # get all shortest paths
-    shortest_paths, _ = reconstruct_all_paths(state.nexts)
+    shortest_paths, _ = tu.reconstruct_all_paths(state.nexts)
 
     demand = torch.nn.functional.pad(state.demand, (0, 1, 0, 1))
     n_routes = state.n_routes_to_plan
@@ -103,7 +102,7 @@ def bee_colony(state, cost_obj, init_network, n_bees=10, passes_per_it=5,
     # set up the cost function to work with batches of bees
     # "multiply" the batch for the bees
     exp_states = sum([[substate] * n_bees 
-                      for substate in state.unbatch()], [])
+                      for substate in state.batch_to_list()], [])
     bee_states = RouteGenBatchState.batch_from_list(exp_states)
     if bee_model is not None:
         bee_states = bee_model.setup_planning(bee_states)
@@ -155,7 +154,7 @@ def bee_colony(state, cost_obj, init_network, n_bees=10, passes_per_it=5,
                 #                                                    n_bees)                
 
                 # unlike the original paper, choose routes uniformly at random
-                chosen_route_idxs = torch.randint(high=n_routes, 
+                chosen_route_idxs = torch.randint(high=n_routes.item(), 
                                                   size=(batch_size, n_bees), 
                                                   device=dev)                
                 new_bee_networks = \
@@ -259,7 +258,7 @@ def get_mutants(bee_networks, chosen_route_idxs, n_type1, n_type2,
         # ...and keep only the type 1 bee routes
         new_type1_routes = new_type1_networks[:, type1_idxs, -1]
     else:
-        unsel_routes = get_unselected_routes(bee_networks, chosen_route_idxs)
+        unsel_routes = tu.get_unselected_routes(bee_networks, chosen_route_idxs)
         remaining_state = env_state.clone()
         remaining_state.replace_routes(unsel_routes.flatten(0,1))
         new_type1_routes = get_bee_1_variants(remaining_state, modified_routes,
@@ -288,8 +287,14 @@ def get_mutants(bee_networks, chosen_route_idxs, n_type1, n_type2,
     return bee_networks
 
 
-def get_neural_variants(model, env_state, bee_networks, drop_route_idxs):
-    # select routes to drop in the same way as above
+def get_neural_variants(model, env_state, bee_networks, drop_route_idxs,
+                        greedy=False):
+    bee_dim = bee_networks.ndim == 4
+    if not bee_dim:
+        # there is no bee dimension, so add one
+        bee_networks = bee_networks.unsqueeze(1)
+        drop_route_idxs = drop_route_idxs.unsqueeze(1)
+
     # flatten batch and bee dimensions
     batch_size = bee_networks.shape[0]
     n_bees = bee_networks.shape[1]
@@ -305,10 +310,12 @@ def get_neural_variants(model, env_state, bee_networks, drop_route_idxs):
 
     # plan a new route with the model
     env_state.replace_routes(flatbee_kept_routes)
-    _, _, _ = model.step(env_state, greedy=False)
-    routes = get_batch_tensor_from_routes(env_state.routes, 
-                                          bee_networks.device)
-    routes = routes.reshape(batch_size, n_bees, n_routes, -1)
+    result = model(env_state, greedy=False)
+    env_state = result.state
+    routes = tu.get_batch_tensor_from_routes(env_state.routes, 
+                                             bee_networks.device)
+    if bee_dim:
+        routes = routes.reshape(batch_size, n_bees, n_routes, -1)
     pad_size = max_n_nodes - routes.shape[-1]
     routes = torch.nn.functional.pad(routes, (0, pad_size), value=-1)
     return routes
@@ -402,10 +409,16 @@ def get_bee_2_variants(batch_bee_routes, shorten_prob, are_neighbours):
         each node is a neighbour of each other node
         
     """
-    # flatten the batch and bee dimensions to ease what follows
-    flat_routes = batch_bee_routes.flatten(0,1)
+    bee_dim = batch_bee_routes.ndim == 3
+    if bee_dim:
+        # flatten the batch and bee dimensions to ease what follows
+        flat_routes = batch_bee_routes.flatten(0,1)
+        n_bees = batch_bee_routes.shape[1]
+    else:
+        flat_routes = batch_bee_routes
+        n_bees = 1
+
     # expand and reshape are_neighbours to match flat_routes
-    n_bees = batch_bee_routes.shape[1]
     are_neighbours = are_neighbours[:, None].expand(-1, n_bees, -1, -1)
     are_neighbours = are_neighbours.flatten(0,1)
     # convert from boolean to float to allow use of torch.multinomial()
@@ -417,7 +430,7 @@ def get_bee_2_variants(batch_bee_routes, shorten_prob, are_neighbours):
     keep_start_term = torch.rand(flat_routes.shape[0], device=dev) > 0.5
     keep_start_term.unsqueeze_(-1)
 
-    route_lens = (flat_routes > -1).sum(-1)[..., None]
+    route_lens = (flat_routes > -1).sum(-1, keepdim=True)
 
     # shorten chosen routes at chosen end
     shortened_at_start = flat_routes.roll(shifts=-1, dims=-1)
@@ -433,7 +446,7 @@ def get_bee_2_variants(batch_bee_routes, shorten_prob, are_neighbours):
     rs_gatherer = route_starts[:, None, None].expand(-1, n_nodes+1, 1)
     start_nbr_probs = neighbour_probs.gather(2, rs_gatherer).squeeze(-1)
     # set the probabilities of nodes already on the route to 0
-    bbr_scatterer = get_update_at_mask(flat_routes, flat_routes==-1, n_nodes)
+    bbr_scatterer = tu.get_update_at_mask(flat_routes, flat_routes==-1, n_nodes)
     start_nbr_probs.scatter_(1, bbr_scatterer, 0)
     no_start_options = start_nbr_probs.sum(-1) == 0
     start_nbr_probs[no_start_options] = 1
@@ -483,16 +496,9 @@ def get_bee_2_variants(batch_bee_routes, shorten_prob, are_neighbours):
     assert ((out_lens - route_lens).abs() <= 1).all()
 
     # fold back into batch x bees
-    out_routes = out_routes.reshape(batch_bee_routes.shape)
+    if bee_dim:
+        out_routes = out_routes.reshape(batch_bee_routes.shape)
     return out_routes
-
-
-def get_random_path_combiner():
-    # with hydra.initialize(version_base=None, config_path="cfg"):
-    cfg = hydra.compose(config_name='neural_bco_mumford.yaml',
-                        overrides=["model=random_path_combiner"])
-    model = lrnu.build_model_from_cfg(cfg)
-    return model
 
 
 @hydra.main(version_base=None, config_path="../cfg", config_name="bco_mumford")
@@ -504,7 +510,7 @@ def main(cfg: DictConfig):
     else:
         prefix = 'bco_'
 
-    DEVICE, run_name, sum_writer, cost_fn, bee_model = \
+    DEVICE, run_name, sum_writer, cost_obj, bee_model = \
         lrnu.process_standard_experiment_cfg(cfg, prefix, 
                                              weights_required=True)
 
@@ -523,14 +529,14 @@ def main(cfg: DictConfig):
     nt1b = cfg.get('n_type1_bees', None)
     nt2b = cfg.get('n_type2_bees', None)
     routes = \
-        lrnu.test_method(bee_colony, test_dl, cfg.eval, cfg.init, cost_fn, 
+        lrnu.test_method(bee_colony, test_dl, cfg.eval, cfg.init, cost_obj, 
             sum_writer=sum_writer, silent=False, n_bees=cfg.n_bees,
             n_iterations=cfg.n_iterations, n_type1_bees=nt1b, n_type2_bees=nt2b,  
             device=DEVICE, bee_model=bee_model, return_routes=True,
             force_linking_unlinked=force_linking_unlinked)[-1]
     
     # save the final routes that were produced
-    dump_routes(run_name, routes)
+    tu.dump_routes(run_name, routes)
     
 
 if __name__ == "__main__":

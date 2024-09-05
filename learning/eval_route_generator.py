@@ -59,8 +59,8 @@ def sample_from_model(model, state, cost_obj, n_samples=20,
             min_route_len = state.min_route_len[ii:ii+sample_batch_size]
             max_route_len = state.max_route_len[ii:ii+sample_batch_size]
         batch_state = RouteGenBatchState(chunk, cost_obj, 
-                                         n_routes, min_route_len, 
-                                         max_route_len)
+                                         state.n_routes_to_plan,
+                                         min_route_len, max_route_len)
         with torch.no_grad():
             plan_out = model(batch_state, greedy=False)
             batch_costs = cost_obj(plan_out.state).cost
@@ -79,8 +79,8 @@ def sample_from_model(model, state, cost_obj, n_samples=20,
     batch_size = len(flat_sample_inputs) // n_samples
     best_plans = [all_plans[mi * batch_size + ii] \
                   for ii, mi in enumerate(min_indices)]
-    best_plans = get_batch_tensor_from_routes(best_plans)
-    state.add_new_routes(best_plans)
+    best_plans_tensor = get_batch_tensor_from_routes(best_plans)
+    state.add_new_routes(best_plans_tensor)
     return state
 
 
@@ -113,7 +113,7 @@ def eval_model(model, eval_dataloader, eval_cfg, cost_obj, sum_writer=None,
 def main(cfg: DictConfig):
     global DEVICE
     assert 'model' in cfg, "Must provide config for model!"
-    DEVICE, run_name, _, cost_fn, model = \
+    DEVICE, run_name, _, cost_obj, model = \
         lrnu.process_standard_experiment_cfg(cfg, 'nn_construction_', 
                                              weights_required=True)
 
@@ -124,7 +124,7 @@ def main(cfg: DictConfig):
     # evaluate the model on the dataset
     n_samples = cfg.get('n_samples', None)
     sbs = cfg.get('sample_batch_size', cfg.batch_size)
-    _, _, routes = eval_model(model, test_dl, cfg.eval, None, cost_fn, 
+    _, _, routes = eval_model(model, test_dl, cfg.eval, cost_obj, 
         n_samples=n_samples, sample_batch_size=sbs, return_routes=True, 
         device=DEVICE)
     

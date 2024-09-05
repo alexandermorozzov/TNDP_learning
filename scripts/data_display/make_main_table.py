@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from aggregate_data import aggregate_and_preprocess_data
+from plotting_utils import aggregate_and_preprocess_data
 
 
 def main():

@@ -6,10 +6,12 @@ import torch
 import networkx as nx
 from networkx.generators.random_graphs import fast_gnp_random_graph
 
-from torch_utils import aggr_edges_over_sequences, aggregate_edge_features, \
-    aggregate_node_features, floyd_warshall, get_path_edge_index, \
-    reconstruct_all_paths, reconstruct_path
+# from torch_utils import aggr_edges_over_sequences, aggregate_edge_features, \
+#     aggregate_node_features, floyd_warshall, get_path_edge_index, \
+#     reconstruct_all_paths, reconstruct_path
+import torch_utils as tu
 from world.street_network import build_graph_from_openstreetmap
+from tests.test_heuristics import mandl_networks
 
 torch.manual_seed(0)
 import numpy as np
@@ -63,9 +65,9 @@ def test_reconstruct_all():
         for _ in range(batch_size):
             test_dist_mats.append(get_random_graph_mat(nn))
         test_dist_tensor = torch.stack(test_dist_mats, dim=0)
-        nexts, dists = floyd_warshall(test_dist_tensor)
-        paths_objs = floyd_warshall(test_dist_tensor, False)
-        all_paths, path_lens = reconstruct_all_paths(nexts)
+        nexts, dists = tu.floyd_warshall(test_dist_tensor)
+        paths_objs = tu.floyd_warshall(test_dist_tensor, False)
+        all_paths, path_lens = tu.reconstruct_all_paths(nexts)
         
         for b_paths_tnsr, b_path_lens, b_path_obj in \
             zip(all_paths, path_lens, paths_objs):
@@ -96,8 +98,8 @@ def test_edge_feature_aggregation(low_memory_mode):
         feat_tensor[:, node_idxs, node_idxs] = 0
 
         # compute the shortest paths through the graph
-        nexts, _ = floyd_warshall(test_dist_tensor)
-        paths_objs = floyd_warshall(test_dist_tensor, False)
+        nexts, _ = tu.floyd_warshall(test_dist_tensor)
+        paths_objs = tu.floyd_warshall(test_dist_tensor, False)
         batch_routes = {bi: {(ss, ee): po.get_path(ss, ee)
                         for ss in range(nn) for ee in range(nn)
                         if ss != ee} 
@@ -105,11 +107,11 @@ def test_edge_feature_aggregation(low_memory_mode):
 
         # aggregate the features over those paths
         sum_agg_feats, sum_edge_counts = \
-            aggregate_edge_features(nexts, feat_tensor, "sum", True)
+            tu.aggregate_edge_features(nexts, feat_tensor, "sum", True)
         mean_agg_feats, mean_edge_counts = \
-            aggregate_edge_features(nexts, feat_tensor, "mean", True)
+            tu.aggregate_edge_features(nexts, feat_tensor, "mean", True)
         agg_seqs, agg_counts = \
-            aggregate_edge_features(nexts, feat_tensor, "concat", True)
+            tu.aggregate_edge_features(nexts, feat_tensor, "concat", True)
 
         # compute the ground truth feature aggregations
         feat_dim = feat_tensor.shape[-1]
@@ -154,8 +156,8 @@ def test_edge_feature_aggregation(low_memory_mode):
 
         # do the same for dense edge aggregation
         # and the same for dense aggregation
-        seq_tnsr, seq_lens = reconstruct_all_paths(nexts)
-        dense_sum_feats = aggr_edges_over_sequences(seq_tnsr, feat_tensor, 
+        seq_tnsr, seq_lens = tu.reconstruct_all_paths(nexts)
+        dense_sum_feats = tu.aggr_edges_over_sequences(seq_tnsr, feat_tensor, 
             'sum', low_memory_mode=low_memory_mode)
         gt_dense_sums = torch.zeros((batch_size, nn, nn, feat_dim))
         gt_dense_means = torch.zeros((batch_size, nn, nn, feat_dim))
@@ -169,7 +171,7 @@ def test_edge_feature_aggregation(low_memory_mode):
             for (ss, ee), route in routes.items():
                 if route is None:
                     continue
-                edge_idx = get_path_edge_index(route, get_dense_edges=True)
+                edge_idx = tu.get_path_edge_index(route, get_dense_edges=True)
                 seq_feats = feat_tensor[bi, edge_idx[0], edge_idx[1]]
                 gt_dense_sums[bi, ss, ee] = seq_feats.sum(dim=0)
                 gt_dense_means[bi, ss, ee] = seq_feats.mean(dim=0)
@@ -178,15 +180,41 @@ def test_edge_feature_aggregation(low_memory_mode):
 
         assert torch.isclose(dense_sum_feats, gt_dense_sums, atol=1e-6).all()
         
-        dense_mean_feats = aggr_edges_over_sequences(seq_tnsr, feat_tensor, 
+        dense_mean_feats = tu.aggr_edges_over_sequences(seq_tnsr, feat_tensor, 
             'mean', low_memory_mode=low_memory_mode)
         assert torch.isclose(dense_mean_feats, gt_dense_means, atol=1e-6).all()
 
-        dense_cat_feats, mask = aggr_edges_over_sequences(
+        dense_cat_feats, mask = tu.aggr_edges_over_sequences(
             seq_tnsr, feat_tensor, 'concat', low_memory_mode=low_memory_mode)
         assert (dense_cat_feats[mask] == 0).all()
         masked_gt = gt_dense_cats[gt_dense_mask]
         assert torch.isclose(dense_cat_feats[mask], masked_gt, atol=1e-6).all()
+
+
+def test_get_nodes_on_routes_mask(mandl_networks):
+    max_n_nodes = 15
+    result_mask = tu.get_nodes_on_routes_mask(max_n_nodes, mandl_networks)
+    gt_mask = torch.tensor([
+        [[1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0],
+         [0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0],
+         [1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+         [0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0],
+         [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0]],
+        [[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+         [0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0],
+         [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0],
+         [1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0]],
+        [[0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+         [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+         [1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0],
+         [0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0]],
+    ], dtype=bool) 
+    assert torch.all(gt_mask == result_mask)
 
 
 def test_node_feature_aggregation():
@@ -203,8 +231,8 @@ def test_node_feature_aggregation():
         feat_tensor = torch.randn((batch_size, nn, feat_dim))
 
         # compute the shortest paths through the graph
-        nexts, _ = floyd_warshall(test_dist_tensor)
-        paths_objs = floyd_warshall(test_dist_tensor, False)
+        nexts, _ = tu.floyd_warshall(test_dist_tensor)
+        paths_objs = tu.floyd_warshall(test_dist_tensor, False)
         batch_routes = {bi: {(ss, ee): po.get_path(ss, ee)
                         for ss in range(nn) for ee in range(nn)
                         if ss != ee} 
@@ -212,11 +240,11 @@ def test_node_feature_aggregation():
 
         # aggregate the features over those paths
         sum_agg_feats, sum_node_counts = \
-            aggregate_node_features(nexts, feat_tensor, "sum", True)
+            tu.aggregate_node_features(nexts, feat_tensor, "sum", True)
         mean_agg_feats, mean_node_counts = \
-            aggregate_node_features(nexts, feat_tensor, "mean", True)
+            tu.aggregate_node_features(nexts, feat_tensor, "mean", True)
         agg_seqs, agg_counts = \
-            aggregate_node_features(nexts, feat_tensor, "concat", True)
+            tu.aggregate_node_features(nexts, feat_tensor, "concat", True)
 
         # compute the ground truth feature aggregations
         feat_dim = feat_tensor.shape[-1]
@@ -265,7 +293,7 @@ def test_node_feature_aggregation():
     
 
 def check_floyd_warshall_on_edges(edge_tensor):
-    paths_objs = floyd_warshall(edge_tensor, False)
+    paths_objs = tu.floyd_warshall(edge_tensor, False)
 
     if edge_tensor.ndim == 2:
         paths_objs = [paths_objs]
@@ -306,10 +334,10 @@ def floyd_warshall_speed_test(network_path):
     edge_tensor = torch.tensor(edge_array)
     # measure the time taken (cpu and gpu)
     start_time = time.perf_counter()
-    floyd_warshall(edge_tensor)
+    tu.floyd_warshall(edge_tensor)
     print('CPU time:', time.perf_counter() - start_time)
 
     edge_tensor = edge_tensor.to(torch.device("cuda"))
     start_time = time.perf_counter()
-    floyd_warshall(edge_tensor)
+    tu.floyd_warshall(edge_tensor)
     print('GPU time:', time.perf_counter() - start_time)
