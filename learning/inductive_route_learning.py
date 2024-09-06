@@ -500,8 +500,10 @@ def train_ppo(model, min_n_routes, max_n_routes, cfg, optimizer,
 
             # compute clip loss
             ratios = (logits - mb_old_logits).exp()
-            if (ratios == 0).any() or ratios.isinf().any():
-                log.warning(f"Ratios are very extreme: {ratios}")
+            if (ratios == 0).any():
+                log.warning(f"Some ratios are zero: {ratios}")
+            if ratios.isinf().any():
+                log.warning(f"Some ratios are very extreme: {ratios}")
 
             assert ratios.isfinite().all()
                 
@@ -730,7 +732,7 @@ def train(model, min_n_routes, max_n_routes, cfg, optimizer, train_dataloader,
             
             pbar.update(data.num_graphs)
 
-        if checkpoint_dir is not None and epoch % checkpoint_rate == 0:
+        if checkpoint_dir is not None:
             ckpt_filename = checkpoint_dir / f"epoch{epoch}.pt"
             torch.save(model.state_dict(), ckpt_filename)
 
