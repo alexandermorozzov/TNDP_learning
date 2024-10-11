@@ -186,7 +186,9 @@ def plot_routes(args, data, routes):
             for node_name, idx in special_nodes.items():
                 n_stops = (routes == idx).sum().item()
                 counts[node_name] = n_stops
-            counts = [counts[nn] for nn in sorted(counts.keys())]
+            sorted_count_names = sorted(counts.keys())
+            # print(sorted_count_names)
+            counts = [counts[nn] for nn in sorted_count_names]
             csv_str = ",".join([str(cc) for cc in counts])
 
     # draw the street graph
@@ -274,6 +276,10 @@ def plot_routes(args, data, routes):
         
         csv_str += "," + str(len(edge_route_counts))
         print(csv_str)
+
+        for edge, count in edge_route_counts.items():
+            if count > 1:
+                print(f"edge {edge} has {count} routes")
             
     x_min, y_min = np_city_pos.min(axis=0)
     x_max, y_max = np_city_pos.max(axis=0)

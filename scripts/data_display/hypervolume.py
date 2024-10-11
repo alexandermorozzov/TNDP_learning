@@ -75,7 +75,7 @@ def main():
     mean = grp.mean()
 
     if args.env is None:
-        envs = unified_df['Environment'].unique()
+        envs = sorted(unified_df['Environment'].unique())
     else:
         envs = args.env
 
@@ -109,7 +109,12 @@ def main():
     ncols = len(envs) + 1 if len(envs) > 1 else 1
     fig_width = 2 * ncols
     fig, axes = plt.subplots(1, ncols, figsize=(fig_width, 6))
-    for env, ax in zip(envs, axes[:-1]):
+    if len(envs) == 1:
+        axes = [axes]
+        iter_axes = axes
+    else:
+        iter_axes = axes[:-1]
+    for env, ax in zip(envs, iter_axes):
     # for env, env_hvs in hypervolumes.items():
         env_hvs = hypervolumes[env]
         env_hvs_df = pd.DataFrame(env_hvs.items(), 
@@ -132,7 +137,7 @@ def main():
     if len(envs) > 1:
         legend_loc = 'center'
     else:
-        legend_loc = args.legend_loc
+        legend_loc = 'upper left'
     handles, labels = g1.get_legend_handles_labels()
     if args.named_colour:
         # sort the handles and labels in the order of the named colours

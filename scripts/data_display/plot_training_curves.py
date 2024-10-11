@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import argparse
 from tensorboard.backend.event_processing import event_accumulator
 
+from plotting_utils import set_tufte_spines
+
 
 # set up seaborn
 matplotlib.rcParams['ps.useafm'] = True
@@ -42,7 +44,7 @@ def extract_stat_from_event_file(event_file_path, stat, statname):
         return pd.DataFrame(columns=["step", "value"])
 
 def plot_stat(directory, stats, statnames=None, plot_types=None, 
-              output_path=None, ylabel='Cost'):
+              output_path=None, ylabel=None):
     """
     Plots the mean curve of a specific statistic from TensorBoard logs, with 
     shading indicating one standard deviation above and below the mean.
@@ -56,13 +58,21 @@ def plot_stat(directory, stats, statnames=None, plot_types=None,
     if not statnames:
         statnames = stats
 
+    assert len(stats) <= 2, "Can only plot up to two statistics at a time."
+
     # Plotting
     plt.figure(figsize=(10, 6))
     if plot_types is None:
         plot_types = "l" * len(stats)
 
-    for stat, statname, plot_type in zip(stats, statnames, plot_types):
+    axes = [plt.gca(), plt.twinx()]
+    # get the collection of colours from the seaborn palette
+    colours = sns.color_palette("colorblind", len(stats))
+
+    for stat, statname, plot_type, ax, ax_side, colour in \
+        zip(stats, statnames, plot_types, axes, ['left', 'right'], colours):
         all_data = []
+        ax.set_ylabel(statname)
 
         # Walk through all sub-directories to find event files
         for root, _, files in os.walk(directory):
@@ -82,37 +92,42 @@ def plot_stat(directory, stats, statnames=None, plot_types=None,
         all_data = pd.concat(all_data)
         if plot_type == 'l':
             gg = sns.lineplot(data=all_data, x="step", y="value", 
-                              estimator="mean", errorbar="sd", label=statname)
+                              estimator="mean", errorbar="sd", label=statname,
+                              ax=ax, color=colour)
         elif plot_type == 's':
             mean = all_data.groupby('step').mean()
             sd = all_data.groupby('step').std()
             eb = plt.errorbar(mean.index, mean['value'], yerr=sd['value'],
                               fmt='o', capsize=4, capthick=2, elinewidth=2,
-                              markersize=7, label=statname)
+                              markersize=7, label=statname, ax=ax,
+                              color=colour)
             plt.plot(mean.index, mean['value'], linestyle='dotted', 
-                     linewidth=1.5, color=eb.lines[0].get_color())
-            # gg = sns.lineplot(data=all_data, x="step", y="value", 
-            #                   estimator="mean")
+                     linewidth=1.5, color=eb.lines[0].get_color(), ax=ax)
 
-            # gg = sns.lineplot(data=all_data, x="step", y="value", 
-            #                   estimator="mean", errorbar="sd", label=statname,
-            #                   markers=True, markersize=10, marker='o')
-
-
-        # for the full plot
-        gg.set(xlim=(0, None), ylim=(0, None))
-        # for the 'zoomed' plot
-        # gg.set(xlim=(20000, None), ylim=(0.5, 0.9))
+        leg = ax.legend()
+        leg.remove()
+        ax.yaxis.label.set_color(colour)
+        xs = all_data['step']
+        # ys = all_data['value']
+        ax.spines['top'].set_visible(False)
+        ax.spines['bottom'].set_bounds(xs.min(), xs.max())
+        # print(ys.min(), ys.max())
+        # print(ax_side)
+        # ax.spines['top'].set_visible(False)
+        # ax.spines['right'].set_visible(False)
+        # ax.spines['bottom'].set_visible(False)
+        # ax.spines['left'].set_visible(False)
 
     # get the current axis of matplotlib
     ax = plt.gca()
     ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    plt.legend(frameon=False)
+    xs = all_data['step']
+    ax.spines['bottom'].set_bounds(xs.min(), xs.max())
+    # ax.spines['bottom'].set_visible(False)
+    # ax.spines['left'].set_bounds(ys.min(), ys.max())
+    # ax.spines['right'].set_bounds(ys.min(), ys.max())
 
     plt.xlabel("# of training episodes")
-    plt.ylabel(ylabel)
 
     if output_path is None:
         # plt.title(f"Mean and Standard Deviation of {statname} Over Time")
@@ -131,7 +146,7 @@ def main():
     parser.add_argument('--statname', '--sn', action='append', 
                         help='if provided, an alternate name to display on '\
                         'the plot for the statistic')
-    parser.add_argument('-y', help='Y-axis label for the plot', default="Cost")
+    parser.add_argument('-y', help='Y-axis label for the plot')
     parser.add_argument('--ms', default=15, type=float, help="Marker size")
     parser.add_argument('--fs', default=2, type=float,
                         help="Font size")
@@ -144,7 +159,6 @@ def main():
     args = parser.parse_args()
 
     fonts = [ff for ff in matplotlib.font_manager.findSystemFonts()]
-    import pdb; pdb.set_trace()
 
     sns.set_context("paper", font_scale=args.fs, 
                     rc={"lines.markersize": args.ms})

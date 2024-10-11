@@ -20,7 +20,10 @@ sns.set_theme(style='ticks', palette='colorblind', font='Times New Roman')
 
 def pareto_plot_from_dataframe(df, args):
     if args.env is None:
-        envs = df['Environment'].unique()
+        # If there's more than one, sort them alphabetically...a bit of a 
+        #  kludge, since it's only a coincidence that alphabetical order is
+        #  the same as number-of-nodes order in this case.
+        envs = sorted(df['Environment'].unique())
     else:
         envs = args.env
 
@@ -120,22 +123,12 @@ def pareto_plot_from_dataframe(df, args):
                            marker='o', label=paper_name)
 
         # use range axes a la Edward Tufte
-        # make each range extend to the min/max of the data plus the std of the
-        #  min and max
-        ymax_loc = mean['$C_o$ (minutes)'].argmax()
-        ymax = mean['$C_o$ (minutes)'].iloc[ymax_loc] + \
-            std['$C_o$ (minutes)'].iloc[ymax_loc]
-        ymin_loc = mean['$C_o$ (minutes)'].argmin()
-        ymin = mean['$C_o$ (minutes)'].iloc[ymin_loc] - \
-            std['$C_o$ (minutes)'].iloc[ymin_loc]
+        ymax = (mean['$C_o$ (minutes)'] + std['$C_o$ (minutes)']).max()
+        ymin = (mean['$C_o$ (minutes)'] - std['$C_o$ (minutes)']).min()
 
-        xmax_loc = mean['$C_p$ (minutes)'].argmax()
-        xmax = mean['$C_p$ (minutes)'].iloc[xmax_loc] + \
-            std['$C_p$ (minutes)'].iloc[xmax_loc]
-        xmin_loc = mean['$C_p$ (minutes)'].argmin()
-        xmin = mean['$C_p$ (minutes)'][xmin_loc] - \
-            std['$C_p$ (minutes)'].iloc[xmin_loc]
-
+        xmax = (mean['$C_p$ (minutes)'] + std['$C_p$ (minutes)']).max()
+        xmin = (mean['$C_p$ (minutes)'] - std['$C_p$ (minutes)']).min()
+                
         pu.set_tufte_spines(ax, xmin, xmax, ymin, ymax)
 
         # don't put axis labels on the subplots
@@ -157,7 +150,7 @@ def pareto_plot_from_dataframe(df, args):
 
     # get the handles and labels from the last subplot
     if not args.nolegend:
-        if len(envs) > 1:
+        if len(envs) > len(flat_axes):
             legend_loc = 'center'
         else:
             legend_loc = args.legend_loc

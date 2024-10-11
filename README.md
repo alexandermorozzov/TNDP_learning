@@ -16,14 +16,14 @@ To train a model, use the script `learning/inductive_route_training.py`.  You wi
 
 ```python learning/inductive_route_training.py dataset.kwargs.path=/path/to/your/dataset```
 
-By default, the model will be trained over a range of cost weights.  To train just on an operator perspective setting, add the argument `experiment/cost_function=op`,
+By default, the model will be trained over a range of cost weights from 0 to 1.  To train just on an operator perspective setting, add the argument `experiment/cost_function=op`,
 or to train on a passenger perspective setting, add `experiment/cost_function=pp`.
 
 Training should take around 1-2 hours on a modern commercial GPU.
 
 You can optionally add the argument `+run_name=my_run_name` to name the training run, which will affect the name of the tensorboard logs (stored by default in a directory called `training_logs`) and the name of the output weight file.  If this is not provided, the current date and time will be used as the name of the run.  
 
-When training is complete, the trained weights will be stored in the directory `output` in a file named `inductive_run-name.pt`.
+When training is complete, the trained weights will be stored in the directory `output` in a file named `inductive_[run-name].pt`.
  
 ## Evaluation
 
@@ -35,13 +35,13 @@ To evaluate a model on a Mumford city, use the script `learning/eval_route_gener
 python learning/eval_route_generator.py +model.weights=path_to_weights.pt eval.dataset.path=/path/to/mumford/Instances +eval=mandl
 ```
 
-To run Bee Colony Optimization, the signature is similar, but without model weights:
+To run the evolutionary algorithm (EA) on a city, the signature is similar, but without model weights:
 
 ```
 python learning/bee_colony.py eval.dataset.path=/path/to/mumford/Instances +eval=mandl
 ```
 
-And to run Neural BCO, use the same script but specify the neural_bco_mumford config file and provide model weights:
+And to run the neural evolutionary algorithm (NEA), use the same script but specify the `neural_bco_mumford` config file and provide model weights:
 ```
 python learning/bee_colony.py --config-name neural_bco_mumford +model.weights=path_to_weights.pt eval.dataset.path=/path/to/mumford/Instances +eval=mandl
 ```
@@ -49,7 +49,10 @@ python learning/bee_colony.py --config-name neural_bco_mumford +model.weights=pa
 # Model weights
 
 Model weights used for the ITSC experiments can be downloaded from the following link:
-https://www.cim.mcgill.ca/~mrl/projs/transit_learning/
+https://www.cim.mcgill.ca/~mrl/projs/transit_learning/itsc_2023
+
+Those used for the most up-to-date PPO experiments (forthcoming) can be downloaded from: 
+https://www.cim.mcgill.ca/~mrl/projs/transit_learning/ppo_2024
 
 # Testing commit hook
 
