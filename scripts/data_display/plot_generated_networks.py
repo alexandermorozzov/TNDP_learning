@@ -15,7 +15,6 @@
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
-from pathlib import Path
 import argparse
 from collections import defaultdict
 
@@ -135,7 +134,7 @@ def get_offset_corner(point1, point2, ext_point, edge_offset, corner_at_1):
     return np.array([x_intersect, y_intersect])
 
 
-def plot_routes(args, data, routes):
+def plot_routes(args, data, routes=None):
     city_pos = data[STOP_KEY].pos
     np_city_pos = city_pos.numpy()
 
@@ -159,12 +158,14 @@ def plot_routes(args, data, routes):
     # include special nodes, if there are any
     if args.special_coords:
         with open(args.special_coords, 'r') as ff:
-            special_latlons = yaml.safe_load(ff)
+            special_coords = yaml.safe_load(ff)
+            special_latlons = {kk: vv['coordinates'] 
+                               for kk, vv in special_coords.items()}
         special_nodes = map_latlons_to_nodes(special_latlons, np_city_pos)
 
         plot_locs = np.array([np_city_pos[nn] for nn in special_nodes.values()])
         markersize = 100
-        # pick a big z-order so that these are on top
+        # use a big z-order so that these are on top
         big_zorder = 100 if routes is None else 2 * len(routes)
 
         ax.scatter(plot_locs[:, 0], plot_locs[:, 1], color='black', 
@@ -173,9 +174,11 @@ def plot_routes(args, data, routes):
             # get vertical range of the nodes
             x_min, y_min = np_city_pos.min(0)
             x_max, y_max = np_city_pos.max(0)
-            y_range = y_max - y_min
-            text_offset = np.array([0, -0.03 * y_range])
-            text_locs = plot_locs + text_offset
+            text_offsets = np.array([vv['text_offset']
+                                    for vv in special_coords.values()])
+            text_offsets[:, 0] *= x_max - x_min
+            text_offsets[:, 1] *= y_max - y_min
+            text_locs = plot_locs + text_offsets
             for node_name, loc in zip(special_nodes.keys(), text_locs):
                 ax.text(loc[0], loc[1], node_name, fontsize=15, 
                         zorder=big_zorder, va='center', ha='center')

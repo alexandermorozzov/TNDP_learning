@@ -78,31 +78,32 @@ def pareto_plot_from_dataframe(df, args):
         # if there is only one row in the group, std will be NaN, so make it 0
         std = std.fillna(0)
         zipped = zip(mean.groupby('Method'), std.groupby('Method'))
-        data_by_env = {ee: (md, sd) for (ee, md), (_, sd) in zipped}
+        data_by_method = {mm: (md, sd) for (mm, md), (_, sd) in zipped}
 
         palette = pu.get_dict_palette(args)
 
         for method in hue_order:
             # iterate over hue order so the dots and errorbars have the same
                 # colours
-            if method not in data_by_env:
+            if method not in data_by_method:
                 continue
 
-            md, sd = data_by_env[method]
+            md, sd = data_by_method[method]
             if not sd.isnull().all().all():
                 if isinstance(palette, dict):
                     color = palette[method]
                 else:
                     color = None
                 ax.errorbar(md['$C_p$ (minutes)'], md['$C_o$ (minutes)'],
-                            sd['$C_o$ (minutes)'], sd['$C_p$ (minutes)'],
+                            xerr=sd['$C_p$ (minutes)'],
+                            yerr=sd['$C_o$ (minutes)'], 
                             fmt='o', capsize=args.cs, capthick=1, markersize=0,
                             ecolor=color)
             
         if args.named_colour:
             # markers = list(range(len(palette)))
             markers = True
-            style_order = [nc if nc in data_by_env else '' 
+            style_order = [nc if nc in data_by_method else '' 
                            for nc in args.named_colour]
         else:
             markers = True
@@ -117,7 +118,7 @@ def pareto_plot_from_dataframe(df, args):
         g1.get_legend().remove()
         
         for paper_name in pu.PAPER_NAME_MAP.values():
-            if paper_name in data_by_env:
+            if paper_name in data_by_method:
                 ax.scatter(mean.loc[paper_name]['$C_p$ (minutes)'],
                            mean.loc[paper_name]['$C_o$ (minutes)'],
                            marker='o', label=paper_name)
@@ -188,7 +189,7 @@ def main():
     parser.add_argument('--named_colour', '--nc', action='append', 
                         help="assign colours to methods in given order")
     parser.add_argument('-e', '--env', action='append',
-                        help='If provided, plot only this environment')
+                        help='If provided, plot only the provided environments')
     parser.add_argument('--legend_loc', '--ll', default='best', 
                         help="location for the legend")
     args = parser.parse_args()

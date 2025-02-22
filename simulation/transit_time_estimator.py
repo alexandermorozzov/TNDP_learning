@@ -321,9 +321,8 @@ class RouteGenBatchState:
         if batch_new_routes.device != self.device:
             batch_new_routes = batch_new_routes.to(self.device)
         # add new routes to the route matrix.
-        new_route_mat = tu.get_route_edge_matrix(
-            batch_new_routes, self.drive_times, 
-            self.mean_stop_time, self.symmetric_routes)
+        new_route_mat = tu.get_route_edge_matrix(batch_new_routes, 
+            self.drive_times, self.mean_stop_time, self.symmetric_routes)
         self.extra_data.route_mat = \
             torch.minimum(self.route_mat, new_route_mat)
 
@@ -409,20 +408,22 @@ class RouteGenBatchState:
                     continue
                 self._finished_routes[bi].append(route[:length])
     
-
     def _update_route_data(self):
         # do things that have to be done whether we added or removed routes
-        nexts, transit_times = tu.floyd_warshall(self.route_mat)
+        fw_mat = self.route_mat + self.transfer_time_s[:, None, None]
+        nexts, transit_times = tu.floyd_warshall(fw_mat)
+        _, path_edge_counts = tu.reconstruct_all_paths(nexts)
+        # subtract one transfer time from each transit time to avoid counting
+         # a transfer for the first edge of a journey
+        transit_times -= self.transfer_time_s[:, None, None]
+
         self.extra_data.route_nexts = nexts
         self.extra_data.transit_times = transit_times
         self.extra_data.has_path = transit_times < float('inf')
-        _, path_lens = tu.reconstruct_all_paths(nexts)
         # number of transfers is number of nodes except start and end
-        n_transfers = (path_lens - 2).clamp(min=0)
+        n_transfers = (path_edge_counts - 2).clamp(min=0)
         # set number of transfers where there is no path to 0
         n_transfers[~self.has_path] = 0
-        transfer_penalties = n_transfers * self.transfer_time_s[:, None, None]
-        self.extra_data.transit_times += transfer_penalties
         self.extra_data.n_transfers = n_transfers
 
     def set_normalized_features(self, norm_stop_features):
@@ -889,6 +890,8 @@ class CostModule(torch.nn.Module):
         n_stops_oob = route_len_delta.sum(-1) + \
             n_unstarted_routes * state.min_route_len
 
+        assert (n_stops_oob >= 0).all(), "negative stops-out-of-bounds!"
+
         # calculate the amount of demand at each number of transfers
         trips_at_transfers = torch.zeros(state.batch_size, 4, device=dev)
         # trips with no path get '3' transfers so they'll be included in d_un,
@@ -1175,16 +1178,13 @@ def get_cost_module_from_cfg(cost_cfg: DictConfig, low_memory_mode=False,
     # setup the cost function
     if cost_cfg.type == 'nikolic':
         cost_obj = NikolicCostModule(low_memory_mode=low_memory_mode, 
-                                     symmetric_routes=symmetric_routes,
                                      **cost_cfg.kwargs)
     elif cost_cfg.type == 'mine':
         cost_obj = MyCostModule(low_memory_mode=low_memory_mode, 
-                                symmetric_routes=symmetric_routes,
                                 **cost_cfg.kwargs)
     elif cost_cfg.type == 'multi':
         cost_obj = MultiObjectiveCostModule(
             low_memory_mode=low_memory_mode,
-            symmetric_routes=symmetric_routes,
             **cost_cfg.kwargs)                                            
     return cost_obj
 

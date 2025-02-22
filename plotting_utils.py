@@ -26,7 +26,7 @@ PAPER_NAME_MAP = {
 HUE_ORDER = ['NEA', 'EA', 'LC-100', 'LC-Greedy', 'LC-40k', 'all-1 NEA', 
              '$\pi_{\\theta_{\\alpha = 1}}$ NEA', 'RC-EA', 'NREA', 'TF', 'STL', 
              '$\pi_{\\theta_{\\alpha = 1}}$ LC-100', 'RC-100', 'RCa-100',
-             'Nikolić (2013)', 'Ahmed (2019)', 'John (2014)']
+             'Nikolić (2013)', 'Ahmed (2019)', 'John (2014)', 'Hüsselmann (2023)']
 
 
 def set_tufte_spines(ax, xmin=None, xmax=None, ymin=None, ymax=None):

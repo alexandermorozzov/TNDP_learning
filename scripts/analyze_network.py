@@ -603,6 +603,7 @@ def count_laval_busriders(demand_csv, start_time=None, end_time=None):
     demands_df = pd.read_csv(demand_csv)
     demands_df = filter_demand_by_time(demands_df, start_time, end_time)
 
+    n_trips = 0
     bus_trips = 0
     parknride_trips = 0
     bus_row_count = 0
@@ -612,15 +613,19 @@ def count_laval_busriders(demand_csv, start_time=None, end_time=None):
         modes = (row["t_mode1"], row["t_mode2"], row["t_mode3"],
                  row["t_mode4"], row["t_mode5"], row["t_mode6"],
                  row["t_mode7"], row["t_mode8"], row["t_mode9"])
+        n_trips += row['t_expf']
         if stl_mode_code in modes:
             bus_trips += row['t_expf']
             bus_row_count += 1
             if any(cc in modes for cc in car_codes):
                 parknride_trips += row['t_expf']
         
-    print(f"OD data indicates {bus_trips} trips were made on Laval buses, \
-        over {bus_row_count} rows")
-    print(f"of those, {parknride_trips} were park-and-rides.")
+    pcnt_bus = bus_trips * 100 / n_trips
+    pcnt_pnr = parknride_trips * 100 / bus_trips
+    print(f"OD data indicates {bus_trips} ({pcnt_bus}%) trips were made on " \
+          "Laval buses, over {bus_row_count} rows")
+    print(f"of those, {parknride_trips} ({pcnt_pnr}%) were park-and-rides.")
+    print(f"There were a total of {n_trips} trips in the period.")
 
 
 def transit_distance_statistics(demand_csv, gtfs_path, 
@@ -834,7 +839,9 @@ if __name__ == "__main__":
     demand_path = laval_dir / "od_2013.csv"
     gtfs_path = laval_dir / "gtfs_nov2013"
     shapefile_path = laval_dir / "dissemination_areas"
-    
+
+    count_laval_busriders(demand_path)
+
     get_dissemination_area_routes(gtfs_path, shapefile_path)
 
     transit_distance_statistics(demand_path, gtfs_path, 

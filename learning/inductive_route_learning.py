@@ -334,18 +334,18 @@ def train_ppo(model, min_n_routes, max_n_routes, cfg, optimizer,
             if iteration == 0:
                 model.update_and_freeze_feature_norms()
 
-        if optuna_trial is not None:
-            optuna_trial.report(avg_val_cost, iteration)
-            if iteration > 0 and optuna_trial.should_prune():
-                # don't prune just because of a bad initialization
-                raise optuna.exceptions.TrialPruned()
+            if optuna_trial is not None:
+                optuna_trial.report(avg_val_cost, iteration)
+                if iteration > 0 and optuna_trial.should_prune():
+                    # don't prune just because of a bad initialization
+                    raise optuna.exceptions.TrialPruned()
 
-        # Kool et al. does this with a paired t-test, we're keeping it simple
-         # for the moment.
-        if avg_val_cost < best_val_cost:
-            # update the best model and the baseline
-            best_model = copy.deepcopy(model)
-            best_val_cost = avg_val_cost
+            # Kool et al. does this with a paired t-test, we're keeping it simple
+            # for the moment.
+            if avg_val_cost < best_val_cost:
+                # update the best model and the baseline
+                best_model = copy.deepcopy(model)
+                best_val_cost = avg_val_cost
 
         if n_routes is None:
             # use the max n routes first, so that if we're going to run out

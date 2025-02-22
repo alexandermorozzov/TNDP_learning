@@ -5,7 +5,7 @@ ppo:
   minibatch_size: 256
   horizon: 120
   epsilon: 0.2
-  use_gae: false
+  use_gae: true
   gae_lambda: 0.95
 
 discount_rate: 0.95

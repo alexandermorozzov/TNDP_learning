@@ -261,7 +261,7 @@ class NSGAII:
                 cost_states = [state] * batch_size
                 cost_states = RouteGenBatchState.batch_from_list(cost_states)
                 cost_states = cost_states.to_device(DEVICE)
-                cost_states.replace_routes(batch_ntwks)
+                cost_states.replace_routes(batch_ntwks.to(DEVICE))
                 costs, are_invalid = self.cost_obj(cost_states)
                 costs = costs.cpu().numpy()
                 zipped = zip(batch_ntwks.cpu(), costs, are_invalid)
@@ -510,7 +510,7 @@ def husselmann_init(state: RouteGenBatchState, n_networks=2000,
 
     # then use algorithm 4 to build a network from these
     adj_mat = weighted_adj_mat > 0
-    n_routes_in_ntwk = state.n_routes_to_plan
+    n_routes_in_ntwk = state.n_routes_to_plan.item()
     if batch_size is None:
         batch_size = n_networks
     networks = []

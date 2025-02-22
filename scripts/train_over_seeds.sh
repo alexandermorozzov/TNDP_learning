@@ -31,6 +31,6 @@ seeds=(
 for ((ii=0; ii<${#seeds[@]}; ii++))
 do
     seed=${seeds[$ii]}
-    python learning/inductive_route_learning.py +run_name=bigbatch_seed_$seed \
-        experiment.seed=$seed
+    python learning/inductive_route_learning.py +run_name=seed_$seed \
+        experiment.seed=$seed 
 done

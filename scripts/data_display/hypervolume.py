@@ -71,6 +71,7 @@ def main():
     sns.set_context("paper", font_scale=args.fs)
 
     unified_df = pu.aggregate_and_preprocess_data(args.data, args.asymmetric)
+    unified_df.replace('LC-100', 'LC-100 (ours)', inplace=True)
     grp = unified_df.groupby(['Method', 'Environment', '$\\alpha$'])
     mean = grp.mean()
 
@@ -84,6 +85,7 @@ def main():
         methods = [mm for mm in args.named_colour if mm in methods]
 
     hypervolumes = {}
+    hv_df = []
     for env, env_df in mean.groupby('Environment'):
         # find the reference point, which is the maximum of the pareto front
 
@@ -101,29 +103,52 @@ def main():
         env_hvs = {}
         hypervolumes[env] = env_hvs
         for method, env_method_df in env_df.groupby('Method'):
-            env_hvs[method] = compute_hypervolume(env_method_df, ref_point)
+            hv = compute_hypervolume(env_method_df, ref_point)
+            env_hvs[method] = hv
+            # hv_df_row = {}
+            # hv_df_row['Environment'] = env
+            # hv_df_row['Method'] = method
+            # hv_df_row['Hypervolume'] = hv
+            # hv_df.append(hv_df_row)
         print(env_hvs)
 
     # make a set of bar charts, one for each environment
     palette = pu.get_dict_palette(args)
     ncols = len(envs) + 1 if len(envs) > 1 else 1
     fig_width = 2 * ncols
+
+    base_hue_order = [hh if hh != 'LC-100' else 'LC-100 (ours)' 
+                      for hh in pu.HUE_ORDER]
+    hue_order = [hh for hh in base_hue_order if hh in methods]
+    # base_hue_order = pu.HUE_ORDER
+
+    # hv_df = pd.DataFrame(hv_df)
+    # g1 = sns.barplot(hv_df, x='Environment', y='Hypervolume', hue='Method',
+    #                  palette=palette, hue_order=hue_order)
+    # plt.show()
+
+    hatches = ['', '/', '\\', '|', '-', '+', 'x', 'o', 'O', '.', '*']
+
     fig, axes = plt.subplots(1, ncols, figsize=(fig_width, 6))
     if len(envs) == 1:
         axes = [axes]
         iter_axes = axes
     else:
         iter_axes = axes[:-1]
+
     for env, ax in zip(envs, iter_axes):
     # for env, env_hvs in hypervolumes.items():
         env_hvs = hypervolumes[env]
         env_hvs_df = pd.DataFrame(env_hvs.items(), 
                                   columns=['Method', 'Hypervolume'])
-        hue_order = [hh for hh in pu.HUE_ORDER if hh in methods]
+        # hue_order = [hh for hh in base_hue_order if hh in methods]
         # add legend and then remove it so the handles and labels are available
         g1 = sns.barplot(env_hvs_df, x='Method', y='Hypervolume', hue='Method',
-                         palette=palette, order=hue_order, ax=ax, 
-                         legend='full')
+                         palette=palette, order=hue_order, ax=ax, legend='full')
+
+        # for hatch, patch in zip(hatches, g1.patches):
+        #     patch.set_hatch(hatch)
+
         g1.get_legend().remove()
         g1.set(xlabel=None, ylabel=None, xticklabels=[])
         ax.set_title(env)
@@ -143,6 +168,8 @@ def main():
         # sort the handles and labels in the order of the named colours
         handles = [handles[labels.index(mm)] for mm in methods]
         labels = methods
+        # for hatch, method, handle in zip(hatches, methods, handles):
+        #     handle.set_hatch(hatch)
 
     axes[-1].axis('off')
     axes[-1].legend(handles, labels, frameon=False, loc=legend_loc)
