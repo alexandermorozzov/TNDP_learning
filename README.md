@@ -19,7 +19,7 @@ To train a model, use the script `learning/inductive_route_training.py`.  You wi
 By default, the model will be trained over a range of cost weights from 0 to 1.  To train just on an operator perspective setting, add the argument `experiment/cost_function=op`,
 or to train on a passenger perspective setting, add `experiment/cost_function=pp`.
 
-Training should take around 1-2 hours on a modern commercial GPU.
+Training should take around 3-6 hours on a modern commercial GPU.
 
 You can optionally add the argument `+run_name=my_run_name` to name the training run, which will affect the name of the tensorboard logs (stored by default in a directory called `training_logs`) and the name of the output weight file.  If this is not provided, the current date and time will be used as the name of the run.  
 

@@ -38,7 +38,6 @@ from simulation.citygraph_dataset import CityGraphData, CityGraphDataset, \
     get_default_train_and_eval_split, get_dynamic_training_set, STOP_KEY, \
     DEMAND_KEY
 from simulation.transit_time_estimator import RouteGenBatchState
-from torch_utils import get_batch_tensor_from_routes
 import learning.utils as lrnu
 from learning.models import FeatureNorm, get_mlp
 from learning.eval_route_generator import eval_model
