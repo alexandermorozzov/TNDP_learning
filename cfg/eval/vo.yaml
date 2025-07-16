@@ -1,0 +1,10 @@
+csv: true
+n_routes: 10
+min_route_len: 4
+max_route_len: 25
+dataset:
+  type: mumford
+  path: datasets/vo_dataset/
+  city: VO
+  scale_dynamically: false
+  

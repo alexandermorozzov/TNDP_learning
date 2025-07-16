@@ -14,6 +14,10 @@
 #
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 
 import logging as log
 
@@ -23,7 +27,7 @@ from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig
 import hydra
 
-from models import check_extensions_add_connections
+from learning.models import check_extensions_add_connections
 import torch_utils as tu
 from simulation.citygraph_dataset import get_dataset_from_config
 from simulation.transit_time_estimator import RouteGenBatchState

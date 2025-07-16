@@ -15,6 +15,10 @@
 # You should have received a copy of the GNU General Public License along with 
 # Transit Learning. If not, see <https://www.gnu.org/licenses/>.
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import argparse
 from collections import defaultdict
 
@@ -277,8 +281,11 @@ def plot_routes(args, data, routes=None):
                 plt.plot((start[0], end[0]), (start[1], end[1]), color=colour, 
                          linewidth=width)
         
-        csv_str += "," + str(len(edge_route_counts))
-        print(csv_str)
+        # csv_str += "," + str(len(edge_route_counts))
+        # print(csv_str)
+        if args.label_special:
+            csv_str += "," + str(len(edge_route_counts))
+            print(csv_str)
 
         for edge, count in edge_route_counts.items():
             if count > 1:

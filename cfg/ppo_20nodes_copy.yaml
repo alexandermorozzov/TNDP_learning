@@ -2,7 +2,7 @@ ppo:
   n_iterations: 200
   val_period: 10
   n_epochs: 1
-  minibatch_size: 25
+  minibatch_size: 128
   horizon: 120
   epsilon: 0.2
   use_gae: true
@@ -12,7 +12,7 @@ discount_rate: 0.95
 diff_reward: true
 baseline_lr: 0.0005
 entropy_weight: 0.0
-batch_size: 25
+batch_size: 128
 reward_scale: 1.0
 # lr: 0.005
 lr: 0.0016134816080499328
@@ -21,8 +21,8 @@ optimizer: Adam
 
 eval:
   n_routes: 10
-  min_route_len: 2
-  max_route_len: 12
+  min_route_len: 8
+  max_route_len: 30
 
 dataset:
   type: pickle
