@@ -804,6 +804,7 @@ class CostHelperOutput:
     batch_routes: Tensor
     per_route_riders: Optional[Tensor] = None
     cost: Optional[Tensor] = None
+    median_connectivity: Optional[Tensor] = None
 
     @property
     def mean_demand_time(self):
@@ -826,6 +827,7 @@ class CostHelperOutput:
             '# disconnected node pairs': 
                 self.n_disconnected_demand_edges.float(),
             '# stops out of bounds': self.n_stops_oob.float(),
+            'median_connectivity': self.median_connectivity,
         }
         return metrics
 
@@ -919,12 +921,26 @@ class CostModule(torch.nn.Module):
         n_duplicate_stops = count_duplicate_stops(state.max_n_nodes, 
                                                   batch_routes)
         # n_skipped_stops = count_skipped_stops(batch_routes)
+        
+        # вычисляем медиану времени для каждого узла ко всем другим узлам
+        # (по строке матрицы времени)
+        transit_times = state.transit_times  # [batch_size, n_nodes, n_nodes]
+        # маска достижимых узлов (чтобы не учитывать inf)
+        reachable_mask = transit_times < float('inf')
+        # заменяем недостижимые значения на nan для корректной медианы
+        transit_times_masked = transit_times.clone()
+        transit_times_masked[~reachable_mask] = float('nan')
+        # медиана по строке для каждого узла
+        node_medians = torch.nanmedian(transit_times_masked, dim=2).values  # [batch_size, n_nodes]
+        # сумма по всем узлам для каждого графа
+        median_connectivity = torch.sum(node_medians, dim=1)  # [batch_size]
 
         output = CostHelperOutput(
             total_dmd_time, state.total_route_time, trips_at_transfers, 
             total_demand, unserved_demand, total_transfers, trip_times,
             state.get_n_disconnected_demand_edges(), n_stops_oob, 
-            n_duplicate_stops, batch_routes
+            n_duplicate_stops, batch_routes,
+            median_connectivity=median_connectivity
         )
 
         if return_per_route_riders:
@@ -1077,9 +1093,13 @@ class MyCostModule(CostModule):
             # normalize cost components
             demand_cost = demand_cost / time_normalizer
             route_cost = route_cost / (time_normalizer * n_routes + 1e-6)
+            median_connectivity = cho.median_connectivity / (time_normalizer)
+            cho.median_connectivity = median_connectivity
+        # new reward function
+        
 
         cost = demand_cost * demand_time_weight + \
-            route_cost * route_time_weight
+            route_cost * route_time_weight + median_connectivity
 
         # compute the weight for the violated-constraint penalty, as an
          # upper bound on how bad the demand and route cost components may be

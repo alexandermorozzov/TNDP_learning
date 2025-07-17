@@ -41,7 +41,7 @@ from torch_geometric.transforms import KNNGraph, RemoveIsolatedNodes, \
 
 import torch_utils as tu
 
-RAW_GRAPH_FILENAME = '/Users/sashamorozov/Documents/Code/GNN/TNDP_learning/output_graphs/mixed/raw_graphs.pkl'
+RAW_GRAPH_FILENAME = '/root/TNDP_learning/output_graphs/raw_graphs_1000.pkl'
 
 STOP_KEY = 'stop'
 STREET_KEY = (STOP_KEY, 'street', STOP_KEY)

@@ -13,17 +13,23 @@ __pycache__/*
 *.pkl
 *.h5
 
+
 # ignore hydra-generated files
 *.hydra*
 
 # ignore datasets
 datasets/*
-
+CEC2013Supp/*
+venv/*
 # ignore experimental records and images
 *.csv
 *.png
 *.db
-
+*.pt
+*.txt
+*.xlsx
+*.yaml
+*.pyc
 # ignore html renderings of routes
 *.html
 
