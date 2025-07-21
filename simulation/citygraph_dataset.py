@@ -137,7 +137,7 @@ class CityGraphDataset(InMemoryDataset):
         transform = Compose(transforms)
 
         super().__init__(root, transform, None, None)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def processed_file_names(self):
@@ -909,7 +909,7 @@ def grid_index(
     row, col = row[mask], col[mask]
 
     edge_index = torch.stack([row, col], dim=0)
-    edge_index = pygu.coalesce(edge_index, None, height * width)
+    edge_index, _ = pygu.coalesce(edge_index, None, height * width)
     return edge_index
 
 

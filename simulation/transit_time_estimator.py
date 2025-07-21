@@ -33,6 +33,9 @@ from omegaconf import DictConfig
 from simulation.citygraph_dataset import STOP_KEY
 import torch_utils as tu
 
+import geopandas as gpd
+import numpy as np
+from iduedu import get_adj_matrix_gdf_to_gdf
 
 MEAN_STOP_TIME_S = 0
 AVG_TRANSFER_WAIT_TIME_S = 300
@@ -75,7 +78,8 @@ class ExtraStateData(HeteroData):
                    'shortest_path_sequences',
                    'route_nexts',
                    'n_transfers',
-                   'fixed_routes']:
+                   'fixed_routes',
+                   'node_coords']:
             return None
         else:
             return super().__cat_dim__(key, value, *args, **kwargs)
@@ -126,6 +130,8 @@ class RouteGenBatchState:
         transit_times[transit_times > 0] = float('inf')
         for ii, dd in enumerate(graph_data.to_data_list()):
             extra_data = ExtraStateData()
+
+            
             extra_data.transit_times = transit_times
             extra_data.route_mat = transit_times.clone()
             dircon = torch.eye(max_n_nodes, device=self.device, dtype=bool)
@@ -861,10 +867,17 @@ class CostModule(torch.nn.Module):
             torch.zeros(1), torch.zeros(1), torch.zeros(1))
         return dummy_obj.get_metrics().keys()
 
+
     def _cost_helper(self, state, return_per_route_riders=False):
         """
-        symmetric_routes: if True, treat routes as going both ways along their
-            stops.
+        Compute cost components including median connectivity using transit_times converted to NetworkX graph.
+        
+        Args:
+            state: Object containing graph_data, transit_times, demand, etc.
+            return_per_route_riders: If True, compute per-route riders (default: False)
+        
+        Returns:
+            CostHelperOutput: Object containing computed cost components
         """
         drive_times_matrix = state.drive_times
         demand_matrix = state.demand
@@ -919,21 +932,73 @@ class CostModule(torch.nn.Module):
         total_demand = demand_matrix.sum(dim=(1,2))
 
         n_duplicate_stops = count_duplicate_stops(state.max_n_nodes, 
-                                                  batch_routes)
-        # n_skipped_stops = count_skipped_stops(batch_routes)
+                                                batch_routes)
+        transit_times = state.transit_times.clone()
+        batch_size = transit_times.shape[0]
+        batch_coords = []
+        offset = 0
+        for data in state.graph_data.to_data_list():
+            # Get coordinates for current graph
+            current_coords = data[STOP_KEY].pos
+            batch_coords.append(current_coords)
+            offset += data.num_nodes
+
+        # Process each batch element separately
+        median_connectivity = torch.zeros(batch_size, device=transit_times.device)
         
-        # вычисляем медиану времени для каждого узла ко всем другим узлам
-        # (по строке матрицы времени)
-        transit_times = state.transit_times  # [batch_size, n_nodes, n_nodes]
-        # маска достижимых узлов (чтобы не учитывать inf)
-        reachable_mask = transit_times < float('inf')
-        # заменяем недостижимые значения на nan для корректной медианы
-        transit_times_masked = transit_times.clone()
-        transit_times_masked[~reachable_mask] = float('nan')
-        # медиана по строке для каждого узла
-        node_medians = torch.nanmedian(transit_times_masked, dim=2).values  # [batch_size, n_nodes]
-        # сумма по всем узлам для каждого графа
-        median_connectivity = torch.sum(node_medians, dim=1)  # [batch_size]
+        for batch_idx in range(batch_size):
+            # Get coordinates for current batch
+            coords = batch_coords[batch_idx]
+            n_nodes = coords.shape[0]  # Get actual number of nodes for this graph
+            
+            # Create GeoDataFrame for current batch
+            gdf = gpd.GeoDataFrame(
+                geometry=gpd.points_from_xy(coords[:, 0], coords[:, 1]),
+                crs="EPSG:4326"
+            )
+            print(coords)
+            crs = gdf.estimate_utm_crs()
+            gdf = gdf.to_crs(crs)
+            
+            # Get transit times for current batch
+            batch_transit_times = transit_times[batch_idx, :n_nodes, :n_nodes]
+                
+            # Create NetworkX graph from batch_transit_times
+            G = nx.DiGraph()
+            G.graph['crs'] = crs  # Set CRS for the graph
+            for i in range(n_nodes):
+                G.add_node(i, x=coords[i, 0], y=coords[i, 1])
+                for j in range(n_nodes):
+                    if batch_transit_times[i, j] < float('inf'):
+                        G.add_edge(i, j, time_min=batch_transit_times[i, j])
+            
+            # Compute adjacency matrix using get_adj_matrix_gdf_to_gdf
+            adj_matrix = get_adj_matrix_gdf_to_gdf(
+                gdf, 
+                gdf, 
+                G, 
+                weight='time_min', 
+                dtype=np.float32
+            )
+            
+            # Convert adjacency matrix to torch tensor
+            adj_matrix_torch = torch.from_numpy(adj_matrix.values).to(transit_times.device)
+            
+            # Update transit_times for current batch
+            transit_times[batch_idx] = adj_matrix_torch
+            
+            # Create mask for reachable nodes (excluding inf values)
+            reachable_mask = adj_matrix_torch < float('inf')
+            
+            # Replace unreachable values with nan for median calculation
+            transit_times_masked = adj_matrix_torch.clone()
+            transit_times_masked[~reachable_mask] = float('nan')
+            
+            # Compute median time for each node to all other nodes
+            node_medians = torch.nanmedian(transit_times_masked, dim=1).values  # [n_nodes]
+            
+            # Compute mean of medians for the current batch
+            median_connectivity[batch_idx] = torch.mean(node_medians)
 
         output = CostHelperOutput(
             total_dmd_time, state.total_route_time, trips_at_transfers, 
@@ -946,10 +1011,10 @@ class CostModule(torch.nn.Module):
         if return_per_route_riders:
             _, used_routes = \
                 tu.get_route_edge_matrix(batch_routes, drive_times_matrix,
-                                         self.mean_stop_time_s, 
-                                         self.symmetric_routes, 
-                                         self.low_memory_mode, 
-                                         return_used_routes=True)
+                                        self.mean_stop_time_s, 
+                                        self.symmetric_routes, 
+                                        self.low_memory_mode, 
+                                        return_used_routes=True)
 
             used_routes.unsqueeze_(-1)
             route_seqs = tu.aggregate_edge_features(state.route_nexts, 
