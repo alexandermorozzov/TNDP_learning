@@ -461,6 +461,8 @@ class CityGraphData(HeteroData):
         # first row gives just the number of nodes
         node_locs = torch.tensor(np.genfromtxt(coords_path, skip_header=1),
                                  dtype=torch.float32)
+        orig_pos = torch.tensor(np.genfromtxt(coords_path, skip_header=1),
+                                 dtype=torch.float32)
         # center locs at 0, which is what the neural network expects
         if center_nodes:
             node_locs = node_locs - node_locs.mean(dim=0)
@@ -507,6 +509,7 @@ class CityGraphData(HeteroData):
             node_features = node_locs
         data[STOP_KEY].x = node_features
         data[STOP_KEY].pos = node_locs
+        data[STOP_KEY].orig_pos = orig_pos
         # set street edges
         street_attr = street_edge_times_s[has_edge]
         data[STREET_KEY].edge_index = street_idx

@@ -936,12 +936,11 @@ class CostModule(torch.nn.Module):
         transit_times = state.transit_times.clone()
         batch_size = transit_times.shape[0]
         batch_coords = []
-        offset = 0
+
         for data in state.graph_data.to_data_list():
             # Get coordinates for current graph
-            current_coords = data[STOP_KEY].pos
+            current_coords = data[STOP_KEY].orig_pos
             batch_coords.append(current_coords)
-            offset += data.num_nodes
 
         # Process each batch element separately
         median_connectivity = torch.zeros(batch_size, device=transit_times.device)
@@ -950,15 +949,13 @@ class CostModule(torch.nn.Module):
             # Get coordinates for current batch
             coords = batch_coords[batch_idx]
             n_nodes = coords.shape[0]  # Get actual number of nodes for this graph
-            
-            # Create GeoDataFrame for current batch
+
+            crs = "EPSG:32636"
+
             gdf = gpd.GeoDataFrame(
                 geometry=gpd.points_from_xy(coords[:, 0], coords[:, 1]),
-                crs="EPSG:4326"
+                crs=crs
             )
-            print(coords)
-            crs = gdf.estimate_utm_crs()
-            gdf = gdf.to_crs(crs)
             
             # Get transit times for current batch
             batch_transit_times = transit_times[batch_idx, :n_nodes, :n_nodes]
@@ -968,9 +965,13 @@ class CostModule(torch.nn.Module):
             G.graph['crs'] = crs  # Set CRS for the graph
             for i in range(n_nodes):
                 G.add_node(i, x=coords[i, 0], y=coords[i, 1])
-                for j in range(n_nodes):
-                    if batch_transit_times[i, j] < float('inf'):
-                        G.add_edge(i, j, time_min=batch_transit_times[i, j])
+
+            # Создаём рёбра только для конечных значений времени
+            finite_indices = batch_transit_times < float('inf')
+            i_indices, j_indices = np.where(finite_indices)
+
+            for i, j in zip(i_indices, j_indices):
+                G.add_edge(i, j, time_min=batch_transit_times[i, j])
             
             # Compute adjacency matrix using get_adj_matrix_gdf_to_gdf
             adj_matrix = get_adj_matrix_gdf_to_gdf(
@@ -984,18 +985,8 @@ class CostModule(torch.nn.Module):
             # Convert adjacency matrix to torch tensor
             adj_matrix_torch = torch.from_numpy(adj_matrix.values).to(transit_times.device)
             
-            # Update transit_times for current batch
-            transit_times[batch_idx] = adj_matrix_torch
-            
-            # Create mask for reachable nodes (excluding inf values)
-            reachable_mask = adj_matrix_torch < float('inf')
-            
-            # Replace unreachable values with nan for median calculation
-            transit_times_masked = adj_matrix_torch.clone()
-            transit_times_masked[~reachable_mask] = float('nan')
-            
             # Compute median time for each node to all other nodes
-            node_medians = torch.nanmedian(transit_times_masked, dim=1).values  # [n_nodes]
+            node_medians = torch.nanmedian(adj_matrix_torch, dim=1).values  # [n_nodes]
             
             # Compute mean of medians for the current batch
             median_connectivity[batch_idx] = torch.mean(node_medians)
