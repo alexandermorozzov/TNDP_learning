@@ -2,7 +2,7 @@ ppo:
   n_iterations: 200
   val_period: 1
   n_epochs: 1
-  minibatch_size: 128
+  minibatch_size: 2
   horizon: 120
   epsilon: 0.2
   use_gae: true
@@ -12,7 +12,7 @@ discount_rate: 0.95
 diff_reward: true
 baseline_lr: 0.0005
 entropy_weight: 0.0
-batch_size: 128
+batch_size: 2
 reward_scale: 1.0
 # lr: 0.005
 lr: 0.0016134816080499328
@@ -22,14 +22,12 @@ optimizer: Adam
 eval:
   n_routes: 10
   min_route_len: 8
-  max_route_len: 30
+  max_route_len: 10
 
 dataset:
-  type: pickle
-  kwargs:
-    path: output_graphs/mixed
-    space_scale: 0.6
-    demand_scale: 0.2
+  type: mumford
+  path: /root/TNDP_learning/CEC2013Supp/Instances
+  city: VO
 
 defaults:
   - _self_
