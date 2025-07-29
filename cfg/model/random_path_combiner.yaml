@@ -15,7 +15,7 @@ backbone_gn:
   kwargs:
     return_edges: false
     in_node_dim: 4
-    in_edge_dim: 13
+    in_edge_dim: 14
 
 defaults:
   - _self_

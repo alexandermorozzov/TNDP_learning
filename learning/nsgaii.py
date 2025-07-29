@@ -223,6 +223,8 @@ class NSGAII:
                                                            device=DEVICE)
             rpc_weights['route_time_weight'] = torch.zeros(self.batch_size,
                                                            device=DEVICE)
+            rpc_weights['median_connectivity_weight'] = torch.zeros(self.batch_size,
+                                                           device=DEVICE)
 
         while len(pop) < self.pop_size:
             if mode == 'model':
@@ -405,7 +407,8 @@ def model_mutator(model, state, networks, greedy=False, weight_mode='random'):
         demand_time_weights = torch.zeros(n_networks, device=DEVICE)
     weights_dict = {
         'demand_time_weight': demand_time_weights,
-        'route_time_weight': 1 - demand_time_weights
+        'route_time_weight': (1 - demand_time_weights) * 0.5,
+        'median_connectivity_weight': (1 - demand_time_weights) * 0.5
     }
     exp_states.set_cost_weights(weights_dict)
 

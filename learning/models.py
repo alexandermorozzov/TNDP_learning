@@ -737,7 +737,7 @@ class RouteScorer(nn.Module):
                  mlp_width=None):
         super().__init__()
         self.embed_dim = embed_dim
-        self.n_extra_feats = 13
+        self.n_extra_feats = 14
         self.dropout = dropout
         if mlp_width is None:
             mlp_width = self.in_dim * 2
@@ -1232,7 +1232,7 @@ class PathCombiningRouteGenerator(RouteGeneratorBase):
         assert self.only_routes_with_demand_are_valid is False, 'not supported'
         self.force_linking_unlinked = force_linking_unlinked
 
-        path_scorer_indim = 16
+        path_scorer_indim = 17
         # self.path_input_norm = FeatureNorm(FEAT_NORM_MOMENTUM, 
         #                                    path_scorer_indim - 1)
         self.path_scorer = nn.Sequential(

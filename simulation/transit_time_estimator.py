@@ -1027,7 +1027,8 @@ class MyCostModule(CostModule):
     def __init__(self, mean_stop_time_s=MEAN_STOP_TIME_S, 
                  avg_transfer_wait_time_s=AVG_TRANSFER_WAIT_TIME_S,
                  symmetric_routes=True, low_memory_mode=False,
-                 demand_time_weight=0.5, route_time_weight=0.5, 
+                 demand_time_weight=0.33, route_time_weight=0.33,
+                 median_connectivity_weight=0.33,
                  constraint_violation_weight=5, variable_weights=False,
                  ignore_stops_oob=False, pp_fraction=0.33, 
                  op_fraction=0.33):
@@ -1035,6 +1036,7 @@ class MyCostModule(CostModule):
                          symmetric_routes, low_memory_mode)
         self.demand_time_weight = demand_time_weight
         self.route_time_weight = route_time_weight
+        self.median_connectivity_weight = median_connectivity_weight
         self.constraint_violation_weight = constraint_violation_weight
         self.variable_weights = variable_weights
         if self.variable_weights:
@@ -1051,26 +1053,35 @@ class MyCostModule(CostModule):
                              device=device)
             rtw = torch.full((batch_size,), self.route_time_weight, 
                               device=device)
+            mcw = torch.full((batch_size,), self.median_connectivity_weight, 
+                              device=device)
         else:
             random_number = torch.rand(batch_size, device=device)
             # Initialized to zero, which is the right value for OP
             dtw = torch.zeros(batch_size, device=device)
+            mcw = torch.zeros(batch_size, device=device)
             # Set demand time weight to 1 where we're using PP
             is_pp = random_number < self.pp_fraction
             dtw[is_pp] = 1.0
-            # Set demand time weight to a random value in [0,1] where it's
-             # neither OP nor PP
+            # Set demand time weight and median connectivity weight to a random value in [0,1] where it's neither OP nor PP
             extremes_fraction = self.pp_fraction + self.op_fraction
             is_intermediate = random_number >= extremes_fraction
             n_intermediate = is_intermediate.sum()
             dtw[is_intermediate] = torch.rand(n_intermediate, device=device)
+            mcw[is_intermediate] = torch.rand(n_intermediate, device=device)
+            # Normalize weights so that dtw + rtw + mcw = 1
+            total = dtw + mcw
+            dtw = dtw / (total + 1e-10)  # Avoid division by zero
+            mcw = mcw / (total + 1e-10)
+            # Route time weight is the remainder
+            rtw = 1 - dtw - mcw
 
-            # reward time weight is 
-            rtw = 1 - dtw
+
  
         return {
             'demand_time_weight': dtw,
-            'route_time_weight': rtw
+            'route_time_weight': rtw,
+            'median_connectivity_weight': mcw,
         }
     
     def get_weights(self, device=None):
@@ -1080,18 +1091,24 @@ class MyCostModule(CostModule):
         rtm = self.route_time_weight
         if type(rtm) is not Tensor:
             rtm = torch.tensor([rtm], device=device)
+        mcw = self.median_connectivity_weight
+        if type(mcw) is not Tensor:
+            mcw = torch.tensor([mcw], device=device)
         
         return {
             'demand_time_weight': dtm,
-            'route_time_weight': rtm
+            'route_time_weight': rtm,
+            'median_connectivity_weight': mcw,
         }
     
     def set_weights(self, demand_time_weight=None, route_time_weight=None, 
-                    constraint_violation_weight=None):
+                                    median_connectivity_weight=None,  constraint_violation_weight=None):
         if demand_time_weight is not None:
             self.demand_time_weight = demand_time_weight
         if route_time_weight is not None:
             self.route_time_weight = route_time_weight
+        if median_connectivity_weight is not None:  
+            self.median_connectivity_weight = median_connectivity_weight
         if constraint_violation_weight is not None:
             self.constraint_violation_weight = constraint_violation_weight
 
@@ -1107,7 +1124,11 @@ class MyCostModule(CostModule):
             route_time_weight = cost_weights['route_time_weight']
         else:
             route_time_weight = self.route_time_weight
-            
+        if 'median_connectivity_weight' in cost_weights:
+            median_connectivity_weight = cost_weights['median_connectivity_weight']
+        else:
+            median_connectivity_weight = self.median_connectivity_weight
+                
         if constraint_weight is None:
             constraint_weight = self.constraint_violation_weight
 
@@ -1118,6 +1139,9 @@ class MyCostModule(CostModule):
         if type(route_time_weight) is Tensor and \
            route_time_weight.shape[0] > state.batch_size:
             route_time_weight = route_time_weight[:state.batch_size]
+        if type(median_connectivity_weight) is Tensor and \
+           median_connectivity_weight.shape[0] > state.batch_size:
+            median_connectivity_weight = median_connectivity_weight[:state.batch_size]
         if type(constraint_weight) is Tensor and \
            constraint_weight.shape[0] > state.batch_size:
             constraint_weight = constraint_weight[:state.batch_size]
@@ -1152,10 +1176,8 @@ class MyCostModule(CostModule):
             median_connectivity = cho.median_connectivity / (time_normalizer)
             cho.median_connectivity = median_connectivity
         # new reward function
-        
-
         cost = demand_cost * demand_time_weight + \
-            route_cost * route_time_weight + median_connectivity
+            route_cost * route_time_weight + median_connectivity_weight*median_connectivity
 
         # compute the weight for the violated-constraint penalty, as an
          # upper bound on how bad the demand and route cost components may be
@@ -1192,11 +1214,17 @@ class MultiObjectiveCostModule(MyCostModule):
 
     def sample_weights(self, batch_size, device=None):
         weights = self.sample_variable_weights(batch_size, device)
-        # introduce one of each type of edge case
         weights['demand_time_weight'][0] = 1.0
         weights['demand_time_weight'][1] = 0.0
+        weights['demand_time_weight'][2] = 0.0
+
         weights['route_time_weight'][0] = 0.0
         weights['route_time_weight'][1] = 1.0
+        weights['route_time_weight'][2] = 0.0
+
+        weights['median_connectivity_weight'][0] = 0.0
+        weights['median_connectivity_weight'][1] = 0.0
+        weights['median_connectivity_weight'][2] = 1.0
         return weights
 
     def forward(self, state, return_per_route_riders=False):
