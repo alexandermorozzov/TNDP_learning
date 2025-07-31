@@ -947,7 +947,7 @@ class CostModule(torch.nn.Module):
         
         for batch_idx in range(batch_size):
             # Get coordinates for current batch
-            coords = batch_coords[batch_idx]
+            coords = batch_coords[batch_idx].cpu()
             n_nodes = coords.shape[0]  # Get actual number of nodes for this graph
 
             crs = "EPSG:32636"
@@ -967,11 +967,11 @@ class CostModule(torch.nn.Module):
                 G.add_node(i, x=coords[i, 0], y=coords[i, 1])
 
             # Создаём рёбра только для конечных значений времени
-            finite_indices = batch_transit_times < float('inf')
+            finite_indices = batch_transit_times.cpu() < float('inf')
             i_indices, j_indices = np.where(finite_indices)
 
             for i, j in zip(i_indices, j_indices):
-                G.add_edge(i, j, time_min=batch_transit_times[i, j])
+                G.add_edge(i, j, time_min=batch_transit_times[i, j].item())
             
             # Compute adjacency matrix using get_adj_matrix_gdf_to_gdf
             adj_matrix = get_adj_matrix_gdf_to_gdf(

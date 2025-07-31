@@ -26,7 +26,7 @@ eval:
 
 dataset:
   type: mumford
-  path: /root/TNDP_learning/CEC2013Supp/Instances
+  path: /home/ruslan/TNDP_learning/CEC2013Supp/Instances
   city: VO
 
 defaults:
