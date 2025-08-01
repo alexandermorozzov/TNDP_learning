@@ -996,14 +996,21 @@ class CostModule(torch.nn.Module):
         # Получаем матрицу кратчайших путей
         all_pairs = self._compute_all_pairs_times_floyd(state)
 
-        # Вычисляем медиану "от всех до всех", исключая диагональ
         B, N, _ = all_pairs.shape
-        eye = torch.eye(N, device=all_pairs.device).bool().unsqueeze(0)
-        all_pairs_masked = all_pairs.masked_fill(eye, torch.nan)
 
-        node_medians = torch.nanmedian(all_pairs_masked, dim=2).values  # [B, N]
-        median_connectivity = torch.nanmean(node_medians, dim=1)        # [B]
+        # Убираем диагональ (расстояние от узла к себе)
+        eye = torch.eye(N, device=all_pairs.device).bool().unsqueeze(0)  # [1, N, N]
+        masked = all_pairs.masked_fill(eye, float('nan'))                # [B, N, N]
 
+        # Меняем inf → nan, чтобы их исключить из медианы
+        masked = masked.masked_fill(~masked.isfinite(), float('nan'))   # теперь только достижимые пути
+
+        # Медиана по достижимым путям для каждого узла
+        node_medians = torch.nanmedian(masked, dim=2).values            # [B, N]
+
+        # Агрегируем по всем узлам
+        tmp = torch.nanmean(node_medians, dim=1)
+        median_connectivity = torch.where(torch.isnan(tmp), torch.tensor(0., device=tmp.device), tmp)
 
         output = CostHelperOutput(
             total_dmd_time, state.total_route_time, trips_at_transfers, 
