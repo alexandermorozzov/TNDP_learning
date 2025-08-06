@@ -1,6 +1,6 @@
 n_bees: 10
 n_type1_bees: 5
-n_iterations: 400
+n_iterations: 100
 batch_size: 10
 force_linking_unlinked: false
 

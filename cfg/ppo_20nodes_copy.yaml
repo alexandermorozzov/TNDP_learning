@@ -24,10 +24,17 @@ eval:
   min_route_len: 8
   max_route_len: 10
 
+# dataset:
+#   type: mumford
+#   path: /home/ruslan/TNDP_learning/CEC2013Supp/Instances
+#   city: VO
+
 dataset:
-  type: mumford
-  path: /home/ruslan/TNDP_learning/CEC2013Supp/Instances
-  city: VO
+  type: pickle
+  kwargs:
+    path: datasets/20_nodes/mixed
+    space_scale: 0.6
+    demand_scale: 0.2
 
 defaults:
   - _self_
