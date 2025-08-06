@@ -1052,7 +1052,7 @@ class MyCostModule(CostModule):
                  median_connectivity_weight=0.33,
                  constraint_violation_weight=5, variable_weights=False,
                  ignore_stops_oob=False, pp_fraction=0.33, 
-                 op_fraction=0.33):
+                 op_fraction=0.33, mcw_fraction=0.33):
         super().__init__(mean_stop_time_s, avg_transfer_wait_time_s,
                          symmetric_routes, low_memory_mode)
         self.demand_time_weight = demand_time_weight
@@ -1061,10 +1061,10 @@ class MyCostModule(CostModule):
         self.constraint_violation_weight = constraint_violation_weight
         self.variable_weights = variable_weights
         if self.variable_weights:
-            # the fraction of variable weights sampled that are PP and OP
             self.pp_fraction = pp_fraction
             self.op_fraction = op_fraction
-            assert pp_fraction + op_fraction <= 1, \
+            self.mcw_fraction = mcw_fraction
+            assert pp_fraction + op_fraction + mcw_fraction <= 1, \
                 "fractions of extreme samples must sum to <= 1"
         self.ignore_stops_oob = ignore_stops_oob
 
@@ -1073,32 +1073,36 @@ class MyCostModule(CostModule):
             dtw = torch.full((batch_size,), self.demand_time_weight, 
                              device=device)
             rtw = torch.full((batch_size,), self.route_time_weight, 
-                              device=device)
+                             device=device)
             mcw = torch.full((batch_size,), self.median_connectivity_weight, 
-                              device=device)
+                             device=device)
         else:
             random_number = torch.rand(batch_size, device=device)
-            # Initialized to zero, which is the right value for OP
             dtw = torch.zeros(batch_size, device=device)
+            rtw = torch.zeros(batch_size, device=device)
             mcw = torch.zeros(batch_size, device=device)
-            # Set demand time weight to 1 where we're using PP
+            
+            # Set weights for extreme cases
             is_pp = random_number < self.pp_fraction
-            dtw[is_pp] = 1.0
-            # Set demand time weight and median connectivity weight to a random value in [0,1] where it's neither OP nor PP
-            extremes_fraction = self.pp_fraction + self.op_fraction
+            dtw[is_pp] = 1.0  # Passenger-perspective: demand_time_weight = 1
+            is_op = (self.pp_fraction <= random_number) & (random_number < self.pp_fraction + self.op_fraction)
+            rtw[is_op] = 1.0  # Operator-perspective: route_time_weight = 1
+            is_mcw = (self.pp_fraction + self.op_fraction <= random_number) & (random_number < self.pp_fraction + self.op_fraction + self.mcw_fraction)
+            mcw[is_mcw] = 1.0  # Connectivity-perspective: median_connectivity_weight = 1
+            
+            # For intermediate cases, generate random weights that sum to 1
+            extremes_fraction = self.pp_fraction + self.op_fraction + self.mcw_fraction
             is_intermediate = random_number >= extremes_fraction
             n_intermediate = is_intermediate.sum()
-            dtw[is_intermediate] = torch.rand(n_intermediate, device=device)
-            mcw[is_intermediate] = torch.rand(n_intermediate, device=device)
-            # Normalize weights so that dtw + rtw + mcw = 1
-            total = dtw + mcw
-            dtw = dtw / (total + 1e-10)  # Avoid division by zero
-            mcw = mcw / (total + 1e-10)
-            # Route time weight is the remainder
-            rtw = 1 - dtw - mcw
+            
+            if n_intermediate > 0:
+                # Generate random weights using uniform distribution on the simplex
+                weights = torch.rand(n_intermediate, 3, device=device)
+                weights = weights / weights.sum(dim=1, keepdim=True)  # Normalize to sum to 1
+                dtw[is_intermediate] = weights[:, 0]
+                rtw[is_intermediate] = weights[:, 1]
+                mcw[is_intermediate] = weights[:, 2]
 
-
- 
         return {
             'demand_time_weight': dtw,
             'route_time_weight': rtw,

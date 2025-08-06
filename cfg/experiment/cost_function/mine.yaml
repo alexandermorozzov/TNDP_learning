@@ -8,7 +8,8 @@ kwargs:
   constraint_violation_weight: 5.0
   # demand and route weights will vary only during training
   variable_weights: true
-  pp_fraction: 0.33
-  op_fraction: 0.33 
+  pp_fraction: 0.15
+  op_fraction: 0.15 
+  mcw_fraction: 0.15
   # pp_fraction: 0.91
   # op_fraction: 0.0

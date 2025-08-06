@@ -4,7 +4,7 @@ min_route_len: 4
 max_route_len: 25
 dataset:
   type: mumford
-  path: datasets/vo_dataset/
+  path: ../TNDP_learning/CEC2013Supp/Instances
   city: VO
   scale_dynamically: false
   
