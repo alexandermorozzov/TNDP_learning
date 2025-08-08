@@ -128,11 +128,12 @@ def main(cfg: DictConfig):
     # evaluate the model on the dataset
     n_samples = cfg.get('n_samples', None)
     sbs = cfg.get('sample_batch_size', cfg.batch_size)
-    _, _, routes = eval_model(model, test_dl, cfg.eval, cost_obj, 
-        n_samples=n_samples, sample_batch_size=sbs, return_routes=True, 
+    _, metrics, routes = eval_model(model, test_dl, cfg.eval, cost_obj, 
+        n_samples=n_samples, sample_batch_size=sbs, return_routes=True,silent=True, 
         device=DEVICE)
     
     dump_routes(run_name, routes.cpu())
+    return metrics
 
 
 if __name__ == "__main__":

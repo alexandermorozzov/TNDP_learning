@@ -1199,7 +1199,7 @@ class MyCostModule(CostModule):
             demand_cost = demand_cost / time_normalizer
             route_cost = route_cost / (time_normalizer * n_routes + 1e-6)
             median_connectivity = cho.median_connectivity / (time_normalizer)
-            cho.median_connectivity = median_connectivity
+            # cho.median_connectivity = median_connectivity
         # new reward function
         cost = demand_cost * demand_time_weight + \
             route_cost * route_time_weight + median_connectivity_weight*median_connectivity

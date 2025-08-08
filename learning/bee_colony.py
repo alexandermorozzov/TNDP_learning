@@ -532,15 +532,18 @@ def main(cfg: DictConfig):
 
     nt1b = cfg.get('n_type1_bees', None)
     nt2b = cfg.get('n_type2_bees', None)
-    routes = \
+    test_output = \
         lrnu.test_method(bee_colony, test_dl, cfg.eval, cfg.init, cost_obj, 
-            sum_writer=sum_writer, silent=False, n_bees=cfg.n_bees,
+            sum_writer=sum_writer, silent=True, n_bees=cfg.n_bees,
             n_iterations=cfg.n_iterations, n_type1_bees=nt1b, n_type2_bees=nt2b,  
             device=DEVICE, bee_model=bee_model, return_routes=True,
-            force_linking_unlinked=force_linking_unlinked)[-1]
+            force_linking_unlinked=force_linking_unlinked)
+    routes = test_output[-1]
+    metrics = test_output[-2]
     
     # save the final routes that were produced
     tu.dump_routes(run_name, routes)
+    return metrics
     
 
 if __name__ == "__main__":
