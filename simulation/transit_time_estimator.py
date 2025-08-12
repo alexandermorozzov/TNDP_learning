@@ -808,6 +808,7 @@ class CostHelperOutput:
     n_stops_oob: Tensor
     n_duplicate_stops: Tensor
     batch_routes: Tensor
+    unserved_demand_matrix: Tensor 
     per_route_riders: Optional[Tensor] = None
     cost: Optional[Tensor] = None
     median_connectivity: Optional[Tensor] = None
@@ -864,7 +865,7 @@ class CostModule(torch.nn.Module):
         dummy_obj = CostHelperOutput(
             torch.zeros(1), torch.zeros(1), torch.zeros(1, 4), torch.zeros(1),
             torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1),
-            torch.zeros(1), torch.zeros(1), torch.zeros(1))
+            torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1),)
         return dummy_obj.get_metrics().keys()
     
     def _compute_all_pairs_times_idu_edu(self, state):
@@ -1012,11 +1013,14 @@ class CostModule(torch.nn.Module):
         tmp = torch.nanmean(node_medians, dim=1)
         median_connectivity = torch.where(torch.isnan(tmp), torch.tensor(0., device=tmp.device), tmp)
 
+        unserved_demand_matrix = demand_matrix * nopath
+        
         output = CostHelperOutput(
             total_dmd_time, state.total_route_time, trips_at_transfers, 
             total_demand, unserved_demand, total_transfers, trip_times,
             state.get_n_disconnected_demand_edges(), n_stops_oob, 
             n_duplicate_stops, batch_routes,
+            unserved_demand_matrix, 
             median_connectivity=median_connectivity
         )
 

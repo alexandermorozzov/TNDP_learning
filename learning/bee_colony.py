@@ -540,10 +540,11 @@ def main(cfg: DictConfig):
             force_linking_unlinked=force_linking_unlinked)
     routes = test_output[-1]
     metrics = test_output[-2]
+    unserved_demand = test_output[-3]
     
     # save the final routes that were produced
     tu.dump_routes(run_name, routes)
-    return metrics
+    return metrics, unserved_demand
     
 
 if __name__ == "__main__":

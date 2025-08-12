@@ -317,7 +317,8 @@ def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj,
             for name, stat_value in mean_metrics.items():
                 print(f"{name}: {stat_value:.3f}")
 
-    out_stats = (final_costs.mean(), final_costs.std(), metrics)
+    unserved_demand = cost_obj(state).unserved_demand_matrix
+    out_stats = (final_costs.mean(), final_costs.std(), unserved_demand,  metrics)
     if return_routes:
         return out_stats + (state.routes,)
     else:

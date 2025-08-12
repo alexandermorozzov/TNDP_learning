@@ -101,13 +101,13 @@ def eval_model(model, eval_dataloader, eval_cfg, cost_obj, sum_writer=None,
             (sample_from_model(model, state, cost_obj, n_samples=n_samples, 
                                sample_batch_size=sample_batch_size), 
              None)
-    cost, _, metrics, routes = \
+    cost, _, unserved_demand, metrics, routes = \
         lrnu.test_method(method_fn, eval_dataloader, eval_cfg, None, cost_obj, 
                          sum_writer, device=device, silent=silent, 
                          iter_num=iter_num, return_routes=True)
     if return_routes:
         routes = get_batch_tensor_from_routes(routes)
-        return cost, metrics, routes
+        return cost, unserved_demand, metrics, routes
     else:
         return cost, metrics
 
@@ -128,12 +128,12 @@ def main(cfg: DictConfig):
     # evaluate the model on the dataset
     n_samples = cfg.get('n_samples', None)
     sbs = cfg.get('sample_batch_size', cfg.batch_size)
-    _, metrics, routes = eval_model(model, test_dl, cfg.eval, cost_obj, 
+    _, unserved_demand, metrics, routes = eval_model(model, test_dl, cfg.eval, cost_obj, 
         n_samples=n_samples, sample_batch_size=sbs, return_routes=True,silent=True, 
         device=DEVICE)
     
     dump_routes(run_name, routes.cpu())
-    return metrics
+    return metrics, unserved_demand
 
 
 if __name__ == "__main__":
