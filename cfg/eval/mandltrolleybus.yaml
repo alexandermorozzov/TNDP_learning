@@ -1,7 +1,7 @@
 csv: true
-n_routes: 6
+n_routes: 2
 min_route_len: 2
-max_route_len: 8
+max_route_len: 6
 dataset:
   type: mumford
   path: ../TNDP_learning/CEC2013Supp/Instances
