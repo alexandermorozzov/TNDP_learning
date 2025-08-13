@@ -238,7 +238,7 @@ def eval_model_over_nroutes(model, eval_dl, n_routes_range, eval_cfg, cost_obj,
     if sumwriter is not None:
         sumwriter.add_scalar("val cost", mean_eval_cost, n_eps)
         for metric_name in ['ATT', 'RTT', '$d_{un}$', 
-                            '# disconnected node pairs', 'median_connectivity']:
+                            '# disconnected node pairs', 'median_connectivity', 'median_connectivity_weighted']:
             mean_value = all_metrics[metric_name].mean()
             sumwriter.add_scalar(f"val {metric_name}", mean_value, n_eps)
 

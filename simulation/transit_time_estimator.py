@@ -812,6 +812,7 @@ class CostHelperOutput:
     per_route_riders: Optional[Tensor] = None
     cost: Optional[Tensor] = None
     median_connectivity: Optional[Tensor] = None
+    median_connectivity_weighted: Optional[Tensor] = None
 
     @property
     def mean_demand_time(self):
@@ -835,6 +836,7 @@ class CostHelperOutput:
                 self.n_disconnected_demand_edges.float(),
             '# stops out of bounds': self.n_stops_oob.float(),
             'median_connectivity': self.median_connectivity,
+            'median_connectivity_weighted': self.median_connectivity_weighted,
         }
         return metrics
 
@@ -994,9 +996,17 @@ class CostModule(torch.nn.Module):
 
         n_duplicate_stops = count_duplicate_stops(state.max_n_nodes, 
                                                 batch_routes)
+        
         # Получаем матрицу кратчайших путей
         all_pairs = self._compute_all_pairs_times_floyd(state)
+        # Берём максимум по строкам (по оси 1)
+        row_max = demand_matrix.max(dim=1, keepdim=True).values  # [N, 1] или [B, N, 1] в батче
 
+        # Чтобы избежать деления на 0
+        row_max = torch.where(row_max == 0, torch.tensor(1., device=row_max.device), row_max)
+
+        # Делим каждую строку на её максимум
+        demand_weight = demand_matrix / row_max
         B, N, _ = all_pairs.shape
 
         # Убираем диагональ (расстояние от узла к себе)
@@ -1004,24 +1014,31 @@ class CostModule(torch.nn.Module):
         masked = all_pairs.masked_fill(eye, float('nan'))                # [B, N, N]
 
         # Меняем inf → nan, чтобы их исключить из медианы
-        masked = masked.masked_fill(~masked.isfinite(), float('nan'))   # теперь только достижимые пути
+        masked = masked.masked_fill(~masked.isfinite(), float('nan'))    # теперь только достижимые пути
 
-        # Медиана по достижимым путям для каждого узла
-        node_medians = torch.nanmedian(masked, dim=2).values            # [B, N]
-
-        # Агрегируем по всем узлам
+        # === 1. Обычная медианная связанность ===
+        node_medians = torch.nanmedian(masked, dim=2).values              # [B, N]
         tmp = torch.nanmean(node_medians, dim=1)
         median_connectivity = torch.where(torch.isnan(tmp), torch.tensor(0., device=tmp.device), tmp)
 
+        # === 2. Взвешенная медианная связанность ===
+        # Маска та же, но домножаем расстояния на веса спроса
+        # demand_weight: [N, N] → добавим ось батча
+        weighted_masked = masked * demand_weight             # [B, N, N]
+        node_medians_w = torch.nanmedian(weighted_masked, dim=2).values   # [B, N]
+        tmp_w = torch.nanmean(node_medians_w, dim=1)
+        median_connectivity_weighted = torch.where(torch.isnan(tmp_w), torch.tensor(0., device=tmp_w.device), tmp_w)
+
         unserved_demand_matrix = demand_matrix * nopath
-        
+
         output = CostHelperOutput(
             total_dmd_time, state.total_route_time, trips_at_transfers, 
             total_demand, unserved_demand, total_transfers, trip_times,
             state.get_n_disconnected_demand_edges(), n_stops_oob, 
             n_duplicate_stops, batch_routes,
             unserved_demand_matrix, 
-            median_connectivity=median_connectivity
+            median_connectivity=median_connectivity,
+            median_connectivity_weighted=median_connectivity_weighted
         )
 
         if return_per_route_riders:
@@ -1202,11 +1219,11 @@ class MyCostModule(CostModule):
             # normalize cost components
             demand_cost = demand_cost / time_normalizer
             route_cost = route_cost / (time_normalizer * n_routes + 1e-6)
-            median_connectivity = cho.median_connectivity / (time_normalizer)
+            median_connectivity_weighted = cho.median_connectivity_weighted / (time_normalizer)
             # cho.median_connectivity = median_connectivity
         # new reward function
         cost = demand_cost * demand_time_weight + \
-            route_cost * route_time_weight + median_connectivity_weight*median_connectivity
+            route_cost * route_time_weight + median_connectivity_weight*median_connectivity_weighted
 
         # compute the weight for the violated-constraint penalty, as an
          # upper bound on how bad the demand and route cost components may be
