@@ -1,6 +1,6 @@
 csv: true
-n_routes: 10
-min_route_len: 4
+n_routes: 20
+min_route_len: 7
 max_route_len: 25
 dataset:
   type: mumford
