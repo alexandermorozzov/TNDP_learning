@@ -91,7 +91,7 @@ def get_default_train_and_eval_split(path, split=0.9, space_scale=0.01,
     return train_ds, eval_ds
 
 
-def get_dataset_from_config(ds_cfg, center_nodes=True):
+def get_dataset_from_config(ds_cfg, center_nodes=True, tensors:dict=None):
     if ds_cfg['type'] == 'pickle':
         return CityGraphDataset(ds_cfg.path, transforms=None)
     elif ds_cfg['type'] == 'mumford':
@@ -110,6 +110,18 @@ def get_dataset_from_config(ds_cfg, center_nodes=True):
             scale_dynamically=do_scaling, extra_node_feats=extra_node_feats,
             fully_connected_demand=True, center_nodes=center_nodes, 
             fixed_routes=fixed_routes)
+        return [data]
+    elif ds_cfg['type'] == 'tensor':
+        assert tensors is not None, "Передан пустой аргумент tensors"
+        assert tensors is not None and all(k in tensors for k in ("node_locs", "street_adj", "demand")), \
+    "В tensors отсутствуют необходимые ключи"
+
+        do_scaling = ds_cfg.get('scale_dynamically', True)
+        extra_node_feats = ds_cfg.get('extra_node_feats', True)
+
+        data = CityGraphData.from_tensors_with_transformations(tensors, 
+            scale_dynamically=do_scaling, extra_node_feats=extra_node_feats,
+            fully_connected_demand=True, center_nodes=center_nodes)
         return [data]
     else:
         raise ValueError(f"Unknown dataset type {ds_cfg['type']}")
@@ -537,6 +549,107 @@ class CityGraphData(HeteroData):
         dmd_edge_feat = torch.stack((demand_feat, drive_time_feat), dim=1)
         data[DEMAND_KEY].edge_attr = dmd_edge_feat
         data.demand = od
+
+        assert data.fixed_routes is not None
+        return data
+    
+    @staticmethod
+    def from_tensors_with_transformations(tensors,
+        assumed_speed_mps=SPEED_MPS,
+        scale_dynamically=True, 
+        extra_node_feats=True,
+        fully_connected_demand=True, 
+        center_nodes=True, 
+        fixed_routes=None,
+        pos_only=False
+    ):
+        """
+        Creates a CityGraphData object from input tensors with transformations similar to from_mumford_data.
+        
+        Args:
+            node_locs (torch.Tensor): Tensor of node coordinates (n_nodes, 2).
+            street_adj (torch.Tensor): Adjacency matrix of street edges in seconds (n_nodes, n_nodes).
+            demand (torch.Tensor): Demand matrix (n_nodes, n_nodes).
+            assumed_speed_mps (float): Assumed speed in meters per second for scaling.
+            scale_dynamically (bool): Whether to dynamically scale node locations.
+            extra_node_feats (bool): Whether to include additional node features.
+            fully_connected_demand (bool): Whether to create fully connected demand edges.
+            center_nodes (bool): Whether to center node locations at 0.
+            fixed_routes (torch.Tensor, optional): Tensor of fixed routes (n_routes, n_nodes).
+            pos_only (bool): If True, node features are set to zero (from from_tensors).
+        """
+        node_locs = tensors["node_locs"]
+        street_adj = tensors["street_adj"]
+        demand = tensors["demand"]
+
+        data = CityGraphData()
+        n_nodes = node_locs.shape[0]
+
+        # Center node locations if specified
+        orig_pos = node_locs.clone()
+        if center_nodes:
+            node_locs = node_locs - node_locs.mean(dim=0)
+
+        # Dynamic scaling based on assumed speed
+        if scale_dynamically:
+            euc_dists = get_euclidean_distances(node_locs)
+            edge_drive_dists_m = street_adj * assumed_speed_mps
+            has_edge = (street_adj > 0) & street_adj.isfinite()
+            has_valid_edge = has_edge & (euc_dists > 0)
+            edge_ratios = edge_drive_dists_m[has_valid_edge] / euc_dists[has_valid_edge]
+            meters_per_unit = edge_ratios.mean()
+            assert meters_per_unit < float('inf')
+            log.info(f"Estimated meters per unit: {meters_per_unit}")
+            side_len = max((node_locs.max(dim=0)[0] - node_locs.min(dim=0)[0])) * meters_per_unit
+            log.info(f"Environment side length: {side_len} meters")
+            node_locs = node_locs * meters_per_unit
+
+        # Set fixed routes
+        if fixed_routes is None:
+            fixed_routes = torch.zeros((0, n_nodes))
+        data.fixed_routes = fixed_routes
+
+        # Set node features
+        has_edge = (street_adj > 0) & street_adj.isfinite()
+        street_idx = torch.stack(torch.where(has_edge))
+        if pos_only:
+            data[STOP_KEY].x = torch.zeros((n_nodes, 0))
+        else:
+            if extra_node_feats:
+                node_features = get_node_features(street_idx, demand)
+                node_features = torch.cat((node_locs, node_features), dim=1)
+            else:
+                node_features = node_locs
+            data[STOP_KEY].x = node_features
+
+        # Set node positions
+        data[STOP_KEY].pos = node_locs
+        data[STOP_KEY].orig_pos = orig_pos
+
+        # Set street edges
+        street_attr = street_adj[has_edge]
+        data[STREET_KEY].edge_index = street_idx
+        data[STREET_KEY].edge_attr = street_attr
+        data.street_adj = street_adj
+
+        # Compute all shortest paths
+        nexts, drive_times = tu.floyd_warshall(street_adj)
+        data.drive_times = drive_times.squeeze(0)
+        data.nexts = nexts.squeeze(0)
+
+        # Compute demand features
+        if fully_connected_demand:
+            dmd_idx = torch.tensor(list(permutations(range(n_nodes), 2))).T
+        else:
+            has_demand = demand > 0
+            dmd_idx = torch.stack(torch.where(has_demand))
+
+        data[DEMAND_KEY].edge_index = dmd_idx
+        demand_feat = demand[dmd_idx[0], dmd_idx[1]]
+        drive_time_feat = drive_times.squeeze(0)[dmd_idx[0], dmd_idx[1]]
+        dmd_edge_feat = torch.stack((demand_feat, drive_time_feat), dim=1)
+        data[DEMAND_KEY].edge_attr = dmd_edge_feat
+        data.demand = demand
 
         assert data.fixed_routes is not None
         return data

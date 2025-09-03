@@ -112,9 +112,9 @@ def eval_model(model, eval_dataloader, eval_cfg, cost_obj, sum_writer=None,
         return cost, metrics
 
 
-@hydra.main(version_base=None, config_path="../cfg", 
-            config_name="eval_model_mumford")
-def main(cfg: DictConfig):
+# @hydra.main(version_base=None, config_path="../cfg", 
+#             config_name="eval_model_mumford")
+def main(cfg: DictConfig, tensors:dict):
     global DEVICE
     assert 'model' in cfg, "Must provide config for model!"
     DEVICE, run_name, _, cost_obj, model = \
@@ -122,7 +122,7 @@ def main(cfg: DictConfig):
                                              weights_required=True)
 
     # load the data
-    test_ds = get_dataset_from_config(cfg.eval.dataset)
+    test_ds = get_dataset_from_config(cfg.eval.dataset, tensors=tensors)
     test_dl = DataLoader(test_ds, batch_size=cfg.batch_size)
 
     # evaluate the model on the dataset
