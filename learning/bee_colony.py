@@ -505,8 +505,8 @@ def get_bee_2_variants(batch_bee_routes, shorten_prob, are_neighbours):
     return out_routes
 
 
-@hydra.main(version_base=None, config_path="../cfg", config_name="bco_mumford")
-def main(cfg: DictConfig):
+# @hydra.main(version_base=None, config_path="../cfg", config_name="bco_mumford")
+def main(cfg: DictConfig, tensors:dict):
     global DEVICE
     use_neural_bees = cfg.get('neural_bees', False)
     if use_neural_bees:
@@ -519,7 +519,7 @@ def main(cfg: DictConfig):
                                              weights_required=True)
 
     # read in the dataset
-    test_ds = get_dataset_from_config(cfg.eval.dataset)
+    test_ds = get_dataset_from_config(cfg.eval.dataset, tensors=tensors)
     test_dl = DataLoader(test_ds, batch_size=cfg.batch_size)
 
     force_linking_unlinked = cfg.get('force_linking_unlinked', False)
