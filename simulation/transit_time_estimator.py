@@ -1068,7 +1068,7 @@ class CostModule(torch.nn.Module):
 class MyCostModule(CostModule):
     def __init__(self, mean_stop_time_s=MEAN_STOP_TIME_S, 
                  avg_transfer_wait_time_s=AVG_TRANSFER_WAIT_TIME_S,
-                 symmetric_routes=True, low_memory_mode=False,
+                 symmetric_routes=True, low_memory_mode=False, use_weighted_connectivity=False,
                  demand_time_weight=0.33, route_time_weight=0.33,
                  median_connectivity_weight=0.33,
                  constraint_violation_weight=5, variable_weights=False,
@@ -1076,6 +1076,7 @@ class MyCostModule(CostModule):
                  op_fraction=0.33, mcw_fraction=0.33):
         super().__init__(mean_stop_time_s, avg_transfer_wait_time_s,
                          symmetric_routes, low_memory_mode)
+        self.use_weighted_connectivity = use_weighted_connectivity
         self.demand_time_weight = demand_time_weight
         self.route_time_weight = route_time_weight
         self.median_connectivity_weight = median_connectivity_weight
@@ -1214,16 +1215,21 @@ class MyCostModule(CostModule):
         # demand_cost = cho.mean_demand_time
         route_cost = cho.total_route_time
 
+        if self.use_weighted_connectivity:
+            median_connectivity = cho.median_connectivity_weighted
+        else:
+            median_connectivity = cho.median_connectivity
+
         # average trip time, total route time, and trips-at-n-transfers
         if not no_norm:
             # normalize cost components
             demand_cost = demand_cost / time_normalizer
             route_cost = route_cost / (time_normalizer * n_routes + 1e-6)
-            median_connectivity_weighted = cho.median_connectivity_weighted / (time_normalizer)
+            median_connectivity =  median_connectivity/ (time_normalizer)
             # cho.median_connectivity = median_connectivity
         # new reward function
         cost = demand_cost * demand_time_weight + \
-            route_cost * route_time_weight + median_connectivity_weight*median_connectivity_weighted
+            route_cost * route_time_weight + median_connectivity_weight*median_connectivity
 
         # compute the weight for the violated-constraint penalty, as an
          # upper bound on how bad the demand and route cost components may be
