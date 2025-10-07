@@ -292,6 +292,17 @@ def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj,
             for key, val in metrics.items():
                 all_metrics[key] = torch.cat((all_metrics[key], val))
 
+        # Print CSV for each element if csv flag is set and average_metrics is False
+        if not silent and eval_cfg.csv and not eval_cfg.get('average_metrics', True):
+            # Print metrics for each element in the current batch
+            batch_size = next(iter(metrics.values())).shape[0]
+            for i in range(batch_size):
+                parts = [eval_cfg.n_routes]
+                for stat in metrics.values():
+                    parts.append(stat[i].item())
+                csv_row = ',' + ','.join([f"{pp:.3f}" for pp in parts])
+                print(csv_row)
+
     # compute some aggregate statistics
     final_costs = torch.cat(final_costs)
     mean_metrics = {key: val.mean() for key, val in all_metrics.items()}
@@ -302,23 +313,23 @@ def test_method(method_fn, dataloader, eval_cfg, init_cfg, cost_obj,
             sum_writer.add_scalar(name, stat_value, iter_num)
 
     if not silent:
-        if eval_cfg.csv:
-            # print statistics in csv format
+        if eval_cfg.csv and eval_cfg.get('average_metrics', True):
+            # print averaged statistics in csv format
             parts = [eval_cfg.n_routes]
-            for stat in metrics.values():
+            for stat in all_metrics.values():
                 parts.append(stat.mean().item())
                 if stat.numel() > 1: 
                     parts.append(stat.std().item())
             csv_row = ',' + ','.join([f"{pp:.3f}" for pp in parts])
             print(csv_row)
-        else:
+        elif not eval_cfg.csv:
             # print overall statistics normally
             print(f"average cost: {final_costs.mean():.3f}")
             for name, stat_value in mean_metrics.items():
                 print(f"{name}: {stat_value:.3f}")
 
     unserved_demand = cost_obj(state).unserved_demand_matrix
-    out_stats = (final_costs.mean(), final_costs.std(), unserved_demand,  metrics)
+    out_stats = (final_costs.mean(), final_costs.std(), unserved_demand, all_metrics)
     if return_routes:
         return out_stats + (state.routes,)
     else:
