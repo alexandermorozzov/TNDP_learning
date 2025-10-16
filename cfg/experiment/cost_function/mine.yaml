@@ -6,6 +6,7 @@ kwargs:
   route_time_weight: 0.33
   median_connectivity_weight: 0.33
   constraint_violation_weight: 5.0
+  use_weighted_connectivity: True
   # demand and route weights will vary only during training
   variable_weights: true
   pp_fraction: 0.15

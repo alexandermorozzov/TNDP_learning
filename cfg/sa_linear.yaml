@@ -1,5 +1,5 @@
 alg_args:
-  n_iterations: 40000
+  n_iterations: 20
   schedule: 'linear'
   # cooling_rate: 3e-5
   # initial_temp: 1

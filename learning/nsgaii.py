@@ -1132,6 +1132,7 @@ def main(cfg: DictConfig):
     output_path = output_path / (run_name + '_front.pkl')
     with output_path.open('wb') as ofile:
         pickle.dump((pareto_networks, pareto_costs), ofile)
+    return pareto_networks, pareto_costs
 
 
 if __name__ == '__main__':
