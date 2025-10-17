@@ -1280,9 +1280,16 @@ class MultiObjectiveCostModule(MyCostModule):
         return weights
 
     def forward(self, state, return_per_route_riders=False):
-        cho = self._cost_helper(state, return_per_route_riders)
-        costs = torch.stack((cho.mean_demand_time, cho.total_route_time), 
-                            dim=-1)
+        cho = super().forward(state, return_per_route_riders=return_per_route_riders)
+        return cho
+    
+    def get_cost(self, cho):
+        if self.use_weighted_connectivity ==True:
+            costs = torch.stack((cho.mean_demand_time, cho.total_route_time, cho.median_connectivity_weighted), 
+                                dim=-1)
+        else:
+            costs = torch.stack((cho.mean_demand_time, cho.total_route_time), 
+                                dim=-1)
         any_violations = cho.are_constraints_violated()
         return costs, any_violations
 

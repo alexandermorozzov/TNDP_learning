@@ -1,6 +1,6 @@
 # Husselmann's settings for NSGA-II
-n_iterations: 20
-pop_size: 20
+n_iterations: 2000
+pop_size: 400
 p_crossover: 0.9
 p_mutation: 0.9
 mutator_p_t: 0.03
@@ -19,7 +19,7 @@ defaults:
 
 
 
-# rpc_model:
-#   route_generator:
-#     kwargs:
-#       halt_prob_is_route_time_weight: true
+rpc_model:
+  route_generator:
+    kwargs:
+      halt_prob_is_route_time_weight: true

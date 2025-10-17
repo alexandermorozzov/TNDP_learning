@@ -48,12 +48,10 @@ class NSGAII:
         self.mutator_p_t = mutator_p_t
 
     def run(self, state: RouteGenBatchState, init_mode: str, sum_writer=None):
-        """Runs the NSGA-II algorithm on a given problem.
-
-        init_mode: 'model' or 'john'.
-        """
-
         assert state.batch_size == 1, "NSGA-II only supports batch_size=1"
+
+        # NEW: Get metric names from cost object
+        metric_names = self.cost_obj.get_metric_names()
 
         # Initialize population
         pop = self.get_init_population(state, init_mode)
@@ -67,11 +65,12 @@ class NSGAII:
         # Sort Population
         pop, pareto_front = self.sort_population(pop)
 
-        # Truncate Extra Members, in case init returned too many
+        # Truncate Extra Members
         pop, pareto_front = self.truncate_population(pop, pareto_front)
 
-        # log statistics of the initial population
-        log_stats(0, pop, pareto_front, state.symmetric_routes, sum_writer)
+        # log statistics of the initial population (NEW: pass metric_names)
+        log_stats(0, pop, pareto_front, state.symmetric_routes, sum_writer, 
+                  metric_names)
 
         # set up variables for the main loop
         p_mutators = np.ones(len(self.mutators)) / len(self.mutators)
@@ -79,7 +78,6 @@ class NSGAII:
         max_route_len = state.max_route_len[0].cpu()        
         n_nodes = state.n_nodes[0].cpu()
         adj_mat = state.street_adj[0].isfinite().cpu()
-        # initialize the population state
         exp_states = [state] * self.pop_size
         pop_states = RouteGenBatchState.batch_from_list(exp_states)
         pop_states = pop_states.to_device(DEVICE)
@@ -88,35 +86,27 @@ class NSGAII:
 
         # Main Loop
         for it in tqdm(range(self.n_iterations)):
-
             # Crossover
             n_to_crossover = int(self.pop_size * self.p_crossover)
-            # first, copy the requisite fraction of parents directly
             n_to_copy = self.pop_size - n_to_crossover
             clones = []
             while len(clones) < n_to_copy:
                 candidates = np.random.choice(pop, size=4, replace=False)
                 parents = [min(pair, key=self.ranking_function) 
-                           for pair in (candidates[:2], candidates[2:])]
+                        for pair in (candidates[:2], candidates[2:])]
                 clone = parents[np.random.randint(2)]['routes'].clone()
                 clones.append(clone)
             
             assert len(clones) == n_to_copy
             child_networks = clones
 
-            # do crossover for the remaining children
             all_parent_pairs = []
             while len(child_networks) < self.pop_size:
-                # keep doing crossover until we have the right number of children
                 all_parent_pairs = []
-
                 while len(all_parent_pairs) < n_to_crossover:
-                    # perform binary tournament selection to pick the parents
-                    # choose both tournament pairs at once to avoid double-picking
                     candidates = np.random.choice(pop, size=4, replace=False)
-                    # winner is the one with a lower ranking (would be sorted earlier)
                     parents = [min(pair, key=self.ranking_function) 
-                                for pair in (candidates[:2], candidates[2:])]
+                            for pair in (candidates[:2], candidates[2:])]
                     all_parent_pairs.append(parents)
 
                 parents1, parents2 = zip(*all_parent_pairs)
@@ -124,19 +114,18 @@ class NSGAII:
                 parents2 = torch.stack([pp['routes'] for pp in parents2])
                 new_child_networks = \
                     parallel_crossover(parents1, parents2, n_nodes, 
-                                       max_route_len, adj_mat)
+                                    max_route_len, adj_mat)
                 n_to_keep = self.pop_size - len(child_networks)
                 child_networks += new_child_networks[:n_to_keep]
 
             child_networks = torch.stack(child_networks)
-            # shuffle the clones and children to avoid any bias
             shuffled_idcs = torch.randperm(child_networks.shape[0])
             child_networks = child_networks[shuffled_idcs]
 
             # Mutation
-            # child_networks = torch.stack(child_networks)
             mutated_networks, mutator_idxs = \
                 self.mutate(state, child_networks, p_mutators)
+                        
             # log number of uses of each mutator
             for mi in range(self.n_mutators):
                 n_uses = (mutator_idxs == mi).sum()
@@ -145,35 +134,45 @@ class NSGAII:
             # Compute costs for children and mutants
             child_states = pop_states.clone()
             child_states.replace_routes(mutated_networks.to(DEVICE))
-            child_costs, has_violation = self.cost_obj(child_states)
-            # replace invalid mutants with un-mutated children
+            cho = self.cost_obj(child_states)
+            child_costs, has_violation = self.cost_obj.get_cost(cho)
+            metrics_dict = cho.get_metrics()  # NEW: get all metrics (dict)
             has_violation = has_violation.cpu().numpy()
+            
             if has_violation.any():
-                # replace the invalid mutants with the original children
                 mutated_networks[has_violation] = child_networks[has_violation]
-                # clear the mutator indices for invalid mutants
                 mutator_idxs[has_violation] = -1
                 child_states.replace_routes(mutated_networks.to(DEVICE))
-                # recompute costs
-                child_costs, has_violation = self.cost_obj(child_states)  
+                cho = self.cost_obj(child_states)
+                child_costs, has_violation = self.cost_obj.get_cost(cho)
+                metrics_dict = cho.get_metrics()  # NEW: update metrics (dict)
+            
             assert not has_violation.any(), \
                 "Child networks should not violate constraints!"
 
             # Create Merged Population
             child_costs = child_costs.cpu().numpy()
+            # NEW: convert metrics dict to list of dicts (one per child)
+            metrics_list = []
+            for ii in range(self.pop_size):
+                child_metrics = {k: v[ii].cpu().item() if torch.is_tensor(v) else v[ii] 
+                                for k, v in metrics_dict.items()}
+                metrics_list.append(child_metrics)
+            
             children = [{'routes': child_networks[ii],
-                         'cost': child_costs[ii],
-                         'rank': None,
-                         'crowding_distance': None}
+                        'cost': child_costs[ii],
+                        'metrics': metrics_list[ii],  # NEW: store metrics dict
+                        'rank': None,
+                        'crowding_distance': None}
                         for ii in range(self.pop_size)]
             pop = pop + children
 
             # Non-dominated Sorting
             pop, pareto_front = non_dominated_sorting(pop)
 
-            # update mutator probabilities
+            # Update mutator probabilities
             nondom_children = [ii - self.pop_size for ii in pareto_front[0]
-                               if ii >= self.pop_size]
+                            if ii >= self.pop_size]
             p_mutators = self.update_mutation_probs(p_mutators, mutator_idxs, 
                                                     nondom_children)
 
@@ -186,69 +185,72 @@ class NSGAII:
             # Truncate Extra Members
             pop, pareto_front = self.truncate_population(pop, pareto_front)
 
-            # Show Iteration Information
+            # Log Iteration Information (NEW: pass metric_names)
             log.debug(f'Iteration {it + 1}: '\
-                        f'Number of Pareto Members = {len(pareto_front[0])}')
+                    f'Number of Pareto Members = {len(pareto_front[0])}')
 
             log_stats(it+1, pop, pareto_front, state.symmetric_routes, 
-                      sum_writer)
+                      sum_writer, metric_names)
 
         # Pareto Front Population
         pareto_pop = [pop[i] for i in pareto_front[0]]
         
+        # Compute metrics for Pareto front
+        pareto_networks = torch.stack([ind['routes'] for ind in pareto_pop])
+        pareto_costs = np.stack([ind['cost'] for ind in pareto_pop])
+        pareto_states = RouteGenBatchState.batch_from_list([state] * len(pareto_pop))
+        pareto_states = pareto_states.to_device(DEVICE)
+        pareto_states.replace_routes(pareto_networks.to(DEVICE))
+        cho = self.cost_obj(pareto_states)
+        pareto_metrics = cho.get_metrics()
+
         return {
             'pop': pop,
             'F': pareto_front,
             'pareto_pop': pareto_pop,
-            'mutator_use_counts': mutator_use_counts
+            'mutator_use_counts': mutator_use_counts,
+            'pareto_networks': pareto_networks,
+            'pareto_costs': pareto_costs,
+            'pareto_metrics': pareto_metrics
         }
-
+    
     def get_init_population(self, state, mode='model'):
         """Valid modes are 'model', 'john', and 'husselmann'."""
         ii = 0
         pop = []
 
-        # then, while the population is not full, generate random networks
         max_route_len = state.max_route_len[0].cpu()
         if mode == 'model':
             exp_states = [state] * self.batch_size
             gen_states = RouteGenBatchState.batch_from_list(exp_states)
             gen_states = gen_states.to_device(DEVICE)
-            # set cost function weights to a spread
             gen_weights = self.cost_obj.sample_weights(self.batch_size)
             gen_states.set_cost_weights(gen_weights)
 
             rpc_weights = {}
-            rpc_weights['demand_time_weight'] = torch.ones(self.batch_size,
-                                                           device=DEVICE)
-            rpc_weights['route_time_weight'] = torch.zeros(self.batch_size,
-                                                           device=DEVICE)
-            rpc_weights['median_connectivity_weight'] = torch.zeros(self.batch_size,
-                                                           device=DEVICE)
+            rpc_weights['demand_time_weight'] = torch.ones(self.batch_size, device=DEVICE)
+            rpc_weights['route_time_weight'] = torch.zeros(self.batch_size, device=DEVICE)
+            rpc_weights['median_connectivity_weight'] = torch.zeros(self.batch_size, device=DEVICE)
 
         while len(pop) < self.pop_size:
             if mode == 'model':
-                # use greedy generation for the first batch, random for the rest
                 greedy = ii == 0
                 networks = []
                 for model in self.init_models:
-                    is_random = isinstance(model, 
-                                           RandomPathCombiningRouteGenerator)
+                    is_random = isinstance(model, RandomPathCombiningRouteGenerator)
                     if is_random:
                         gen_states.set_cost_weights(rpc_weights)
                     else:
                         gen_states.set_cost_weights(gen_weights)
 
                     if greedy and not is_random:
-                        # use greedy generation for part of the batch
                         gen_states = model(gen_states, greedy=True).state
                     else:
                         gen_states = model(gen_states, greedy=False).state
 
                     networks += gen_states.routes
                     gen_states.clear_routes()
-                networks = tu.get_batch_tensor_from_routes(
-                    networks, max_route_len=max_route_len)
+                networks = tu.get_batch_tensor_from_routes(networks, max_route_len=max_route_len)
 
             elif mode == 'john':
                 networks = init.john_init(state, show_pbar=True)
@@ -257,25 +259,36 @@ class NSGAII:
             else:
                 raise ValueError(f"Invalid initialization mode: {mode}")
 
-            # compute costs of all
             for batch_ntwks in torch.split(networks, self.batch_size):
                 batch_size = batch_ntwks.shape[0]
                 cost_states = [state] * batch_size
                 cost_states = RouteGenBatchState.batch_from_list(cost_states)
                 cost_states = cost_states.to_device(DEVICE)
                 cost_states.replace_routes(batch_ntwks.to(DEVICE))
-                costs, are_invalid = self.cost_obj(cost_states)
+                cho = self.cost_obj(cost_states)
+                costs, are_invalid = self.cost_obj.get_cost(cho)
+                metrics_dict = cho.get_metrics()  # NEW: get all metrics (dict)
                 costs = costs.cpu().numpy()
-                zipped = zip(batch_ntwks.cpu(), costs, are_invalid)
-                pop += [{'routes': nn.clone(), 'cost': cc, 
-                        'rank': None, 'crowding_distance': None}
-                        for (nn, cc, is_inv) in zipped if not is_inv]
+                
+                # NEW: convert metrics dict to list of dicts (one per network)
+                metrics_list = []
+                for jj in range(batch_size):
+                    network_metrics = {k: v[jj].cpu().item() if torch.is_tensor(v) else v[jj] 
+                                      for k, v in metrics_dict.items()}
+                    metrics_list.append(network_metrics)
+                
+                zipped = zip(batch_ntwks.cpu(), costs, metrics_list, are_invalid)
+                pop += [{'routes': nn.clone(), 
+                        'cost': cc, 
+                        'metrics': mm,  # NEW: store metrics dict
+                        'rank': None, 
+                        'crowding_distance': None}
+                        for (nn, cc, mm, is_inv) in zipped if not is_inv]
 
-            ii += 1
-            log.info(f"{len(pop)} networks generated after {ii} iterations.")
+                ii += 1
+                log.info(f"{len(pop)} networks generated after {ii} iterations.")
 
-        log.info(f"Initial pop. of {len(pop)} networks generated after "\
-                 f"{ii} iterations.")
+        log.info(f"Initial pop. of {len(pop)} networks generated after {ii} iterations.")
         return pop
     
     def mutate(self, state, child_networks, mutator_probs=None):
@@ -419,7 +432,12 @@ def model_mutator(model, state, networks, greedy=False, weight_mode='random'):
     return mutated.cpu()
 
 
-def log_stats(it, pop, pareto_front, symmetric_routes, sum_writer):
+def log_stats(it, pop, pareto_front, symmetric_routes, sum_writer, metric_names):
+    """Enhanced logging function that logs all metrics, similar to bee_colony.
+    
+    Note: In bee_colony, metrics are averaged across the batch (multiple scenarios).
+    In NSGA-II, we take the minimum across the Pareto front (single scenario, multiple solutions).
+    """
     if not sum_writer:
         return 
 
@@ -428,16 +446,35 @@ def log_stats(it, pop, pareto_front, symmetric_routes, sum_writer):
     # costs are in seconds but we want them in minutes
     min_costs = pareto_costs.min(axis=0) / 60
 
-    # log the minimum value of each cost component
+    # log the minimum value of each cost component (backwards compatibility)
     sum_writer.add_scalar('min avg demand time (minutes)', min_costs[0], it)
     rtt = min_costs[1]
     if symmetric_routes:
         rtt /= 2
     sum_writer.add_scalar('min total route time (minutes)', rtt, it)
+    
+    # NEW: Log all metrics from the Pareto front
+    # Get metrics for all pareto front members (metrics is a dict)
+    pareto_metrics_list = [pop[ii].get('metrics', None) 
+                           for ii in pareto_front[0] 
+                           if pop[ii].get('metrics', None) is not None]
+    
+    if len(pareto_metrics_list) > 0 and metric_names:
+        # Convert list of dicts to dict of arrays
+        metrics_dict = {}
+        for metric_name in metric_names:
+            values = [m[metric_name] for m in pareto_metrics_list]
+            metrics_dict[metric_name] = np.array(values)
+        
+        # Log minimum value of each metric across the pareto front
+        # (analogous to mean() in bee_colony which averages across batch)
+        for name in metric_names:
+            min_val = metrics_dict[name].min()
+            sum_writer.add_scalar(f'best {name}', min_val, it)
+    
     # log an image of the pareto fronts
     img = plot_pareto_fronts(pop, pareto_front)
     sum_writer.add_image('pareto front', img, it)
-
 
 def plot_pareto_fronts(pop, pareto_fronts, cost_maxes=None, n_fronts=1, 
                        return_array=True):
@@ -1097,15 +1134,12 @@ def main(cfg: DictConfig):
 
     if cfg.use_model_heuristics:
         for model, (model_name, _) in zip(models, model_name_cfg_pairs):
-            # stochastic policy mutator
             mutators.append(lambda ss, nn: model_mutator(model, ss, nn))
             mutator_names.append(model_name + '_stochastic')
             if not isinstance(model, RandomPathCombiningRouteGenerator):
-                # greedy policy mutator
                 mutators.append(lambda ss, nn: \
                                 model_mutator(model, ss, nn, True))
                 mutator_names.append(model_name + '_greedy')
-
 
     # set up the NSGA-II optimizer
     gen_batch_size = cfg.get('gen_batch_size', None)
@@ -1123,16 +1157,18 @@ def main(cfg: DictConfig):
     
     # save the pareto front
     pareto_pop = output['pareto_pop']
-    pareto_networks = torch.stack([ind['routes'] for ind in pareto_pop])
-    pareto_networks = pareto_networks.cpu()
-    pareto_costs = np.stack([pop['cost'] for pop in pareto_pop])
-    # pickle the networks and costs to a file
+    pareto_networks = output['pareto_networks']
+    pareto_costs = output['pareto_costs']
+    pareto_metrics = output['pareto_metrics']
+    
+    # pickle the networks, costs, and metrics to a file
     output_path = Path('output')
     output_path.mkdir(exist_ok=True)
     output_path = output_path / (run_name + '_front.pkl')
     with output_path.open('wb') as ofile:
-        pickle.dump((pareto_networks, pareto_costs), ofile)
-    return pareto_networks, pareto_costs
+        pickle.dump((pareto_networks, pareto_costs, pareto_metrics), ofile)
+    
+    return pareto_networks, pareto_costs, pareto_metrics
 
 
 if __name__ == '__main__':
