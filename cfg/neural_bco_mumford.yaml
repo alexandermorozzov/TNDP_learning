@@ -1,6 +1,6 @@
 n_bees: 10
-n_iterations: 100
-batch_size: 10
+n_iterations: 400
+batch_size: 1
 neural_bees: true
 force_linking_unlinked: false
 

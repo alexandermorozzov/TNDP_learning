@@ -1,4 +1,4 @@
-logdir: 'training_logs'
+logdir: 'conv_training_logs'
 anomaly: False
 cpu: False
 seed: 0

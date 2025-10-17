@@ -680,7 +680,7 @@ def _get_delete_node_options(state, networks, mode='any'):
     networks: a torch.Tensor of shape (batch_size, num_routes, route_len)
     mode: 'any', 'inside', or 'terminal'
     """
-    adj_mat = get_formatted_adj_mat(state, networks)
+    adj_mat = get_formatted_adj_mat(state, networks).clone()
     # set dummy node rows to True, so they're adjacent to everything
     adj_mat[:, -1, :] = True
     adj_mat[:, :, -1] = True
